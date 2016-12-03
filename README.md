@@ -9,7 +9,7 @@ Asynchronous, HA (master-master) PostgreSQL driver on top of libpq.
 * Every SQL operation is on it's own, no transactions (at least initially).
 * If a node fails, the operation is transparently retried on another node.
 * Operations are exposed as `futures`.
-* `futures` are backed by a thread or two and can be used without a `tokyo` reactor (because KISS).
+* `futures` are backed by a thread or two and can be used without a `tokio` reactor (because KISS).
 * Response is handled as JSON, [{column: value}, {column: value}].
 * Fast mode: send the operation to every node and return the first answer.
 * Pin mode: send the operation to one of the nodes only (useful to avoid some of the master-master conflicts).
