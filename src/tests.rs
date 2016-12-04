@@ -9,12 +9,12 @@ lazy_static! {
 #[test] fn select1() {
   let mut cluster = Cluster::new() .expect ("!Cluster");
   for dsn in DSNS.iter() {
-    cluster.connect (dsn.clone()) .expect ("!connect")}
+    cluster.connect (dsn.clone(), 1) .expect ("!connect")}
 
   for _ in 0..10 {
-    cluster.execute ("SELECT 1".into()) .expect ("!SELECT 1");
-    cluster.execute ("SELECT 2; SELECT 3".into()) .expect ("!select 2 3");
-    cluster.execute ("SELECT 4".into()) .expect ("!select 4");}
+    cluster.execute ("SELECT 1".into()) .expect ("!select 1");
+    cluster.execute ("SELECT 2".into()) .expect ("!select 2");
+    cluster.execute ("SELECT 3".into()) .expect ("!select 3");}
 
   println! ("Final sleep.");
   std::thread::sleep (std::time::Duration::from_secs (1));
