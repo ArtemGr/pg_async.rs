@@ -5,61 +5,99 @@
 
 #![feature(type_ascription, integer_atomics)]
 
+extern crate futures;
 #[macro_use] extern crate gstuff;
 extern crate itertools;
 #[macro_use] extern crate lazy_static;
 extern crate libc;
 extern crate nix;
+extern crate serde_json;
 
+use futures::{Future, Poll, Async};
+use futures::task::{park, Task};
 use libc::c_int;
 use nix::poll::{self, EventFlags, PollFd};
 use nix::fcntl::{O_NONBLOCK, O_CLOEXEC};
+//use serde_json::{Value as Json};
 use std::collections::VecDeque;
 use std::ffi::{CString, CStr};
 use std::fmt;
+use std::io;
 use std::ptr::null_mut;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Sender, Receiver, TryRecvError};
 use std::thread::JoinHandle;
 
 #[cfg(test)] mod tests;
 
-struct PgResultImpl {
-  id: u64,
-  sql: String,
-  res: AtomicPtr<pq::PGresult>}
-impl Drop for PgResultImpl {
+pub struct PgResult (*mut pq::PGresult);
+
+// cf. https://www.postgresql.org/docs/9.4/static/libpq-threading.html
+unsafe impl Sync for PgResult {}
+unsafe impl Send for PgResult {}
+
+impl Drop for PgResult {
   fn drop (&mut self) {
-    let res: *mut pq::PGresult = self.res.swap (null_mut(), Ordering::Relaxed);
-    if res != null_mut() {
-      unsafe {pq::PQclear (res)}}}}
-
-/// Delayed SQL result.
-#[derive(Clone)]
-pub struct PgResult (Arc<PgResultImpl>);
-
-impl PgResult {
-  fn new (id: u64, sql: String) -> PgResult {
-    PgResult (Arc::new (PgResultImpl {
-        id: id,
-        sql: sql,
-        res: AtomicPtr::new (null_mut())}))}}
+    assert! (self.0 != null_mut());
+    unsafe {pq::PQclear (self.0)}}}
 
 impl fmt::Debug for PgResult {
   fn fmt (&self, ft: &mut fmt::Formatter) -> Result<(), fmt::Error> {
-    write! (ft, "PgResult ({}, {})", self.0.id, self.0.sql)}}
+    write! (ft, "PgResult")}}
+
+struct PgFutureSync {
+  res: Option<PgResult>,
+  task: Option<Task>}
+
+struct PgFutureImpl {
+  id: u64,
+  sql: String,
+  sync: Mutex<PgFutureSync>}
+
+/// Delayed SQL result.
+#[derive(Clone)]
+pub struct PgFuture (Arc<PgFutureImpl>);
+
+impl PgFuture {
+  fn new (id: u64, sql: String) -> PgFuture {
+    PgFuture (Arc::new (PgFutureImpl {
+      id: id,
+      sql: sql,
+      sync: Mutex::new (PgFutureSync {
+        res: None,
+        task: None})}))}}
+
+impl fmt::Debug for PgFuture {
+  fn fmt (&self, ft: &mut fmt::Formatter) -> Result<(), fmt::Error> {
+    write! (ft, "PgFuture ({}, {})", self.0.id, self.0.sql)}}
+
+impl Future for PgFuture {
+  type Item = PgResult;
+  type Error = String;
+  fn poll (&mut self) -> Poll<PgResult, String> {
+    let mut sync = try_s! (self.0.sync.lock());
+
+    if sync.res.is_none() {
+      sync.task = Some (park());
+      return Ok (Async::NotReady)}
+
+    let mut res = None;
+    std::mem::swap (&mut res, &mut sync.res);
+    let res = res.unwrap();
+
+    Ok (Async::Ready (res))}}
 
 #[derive(Debug)]
 enum Message {
   Connect (String, u8),
-  Execute (PgResult),
+  Execute (PgFuture),
   Drop}
 
 #[derive(Debug)]
 struct Connection {
   conn: *mut pq::PGconn,
-  in_flight: VecDeque<PgResult>}
+  in_flight: VecDeque<PgFuture>}
 
 fn event_loop (rx: Receiver<Message>, read_end: c_int) {
   // NB: Connection must not leak into other threads.
@@ -115,8 +153,10 @@ fn event_loop (rx: Receiver<Message>, read_end: c_int) {
         // Similar to how libpqxx pipelining works, cf.
         // https://github.com/jtv/libpqxx/blob/master/include/pqxx/pipeline.hxx
         // https://github.com/jtv/libpqxx/blob/master/src/pipeline.cxx
-        let sql = itertools::join (pending_sqls.iter().map (|pr| &pr.0.sql[..]), "; ");
-        println! ("SQL batch: {}", sql);
+        let mut sql = String::with_capacity (pending_sqls.iter().map (|en| en.0.sql.len()) .sum::<usize>() + (2 * pending_sqls.len()));
+        for pending in pending_sqls.iter() {
+          if !sql.is_empty() {sql.push_str ("; ")}
+          sql.push_str (&pending.0.sql);}
         let sql = CString::new (sql) .expect ("!sql");
         let rc = unsafe {pq::PQsendQuery (conn.conn, sql.as_ptr())};
         if rc == 0 {panic! ("!PQsendQuery: {}", error_message (conn.conn))}
@@ -137,16 +177,16 @@ fn event_loop (rx: Receiver<Message>, read_end: c_int) {
           if res == null_mut() {
             assert! (conn.in_flight.is_empty(), "leftovers: {:?}", conn.in_flight);
             break}
-          let value = unsafe {CStr::from_ptr (pq::PQgetvalue (res, 0, 0))} .to_str() .expect ("!value");
-          let pg_result = conn.in_flight.pop_front().expect ("!pop_front");
-          println! ("Got PGresult: {:?}, future: {:?}, value: '{}'.", res, pg_result, value);
-          pg_result.0.res.store (res, Ordering::Relaxed);}
+          let pg_future = conn.in_flight.pop_front().expect ("!pop_front");
+          let mut sync = pg_future.0.sync.lock().expect ("!lock");
+          sync.res = Some (PgResult (res));
+          if let Some (ref task) = sync.task {task.unpark()}}
 
         fds.push (PollFd::new (sock, poll::POLLIN, EventFlags::empty()))}}
 
     fds.push (PollFd::new (read_end, poll::POLLIN, EventFlags::empty()));
     let rc = poll::poll (&mut fds, 100) .expect ("!poll");
-    println! ("poll rc: {}.", rc);}
+    if rc == -1 {panic! ("!poll: {}", io::Error::last_os_error())}}
 
   for conn in good_connections {unsafe {pq::PQfinish (conn.conn)}}
   for conn in pending_connections {unsafe {pq::PQfinish (conn)}}}
@@ -192,14 +232,19 @@ impl Cluster {
   ///
   /// The client must ensure that no more than a single command is passed.
   /// Passing multiple queries "SELECT 1; SELECT 2" is *not* allowed.
-  pub fn execute (&mut self, sql: String) -> Result<PgResult, String> {
+  ///
+  /// No transactions allowed.
+  /// (CTEs might be used as a workaround, cf.
+  ///  https://www.postgresql.org/docs/9.4/static/queries-with.html#QUERIES-WITH-MODIFYING,
+  ///  https://omniti.com/seeds/writable-ctes-improve-performance).
+  pub fn execute (&mut self, sql: String) -> Result<PgFuture, String> {
     self.command_num.compare_and_swap (u64::max_value(), 0, Ordering::Relaxed);  // Recycle the set of identifiers.
     let id = self.command_num.fetch_add (1, Ordering::Relaxed) + 1;
-    let pg_result = PgResult::new (id, sql);
+    let pg_future = PgFuture::new (id, sql);
 
-    try_s! (self.tx.send (Message::Execute (pg_result.clone())));
+    try_s! (self.tx.send (Message::Execute (pg_future.clone())));
     try_s! (nix::unistd::write (self.write_end, &[2]));
-    Ok (pg_result)}}
+    Ok (pg_future)}}
 
 impl Drop for Cluster {
   fn drop (&mut self) {

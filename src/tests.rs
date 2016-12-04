@@ -11,11 +11,14 @@ lazy_static! {
   for dsn in DSNS.iter() {
     cluster.connect (dsn.clone(), 1) .expect ("!connect")}
 
-  for _ in 0..10 {
-    cluster.execute ("SELECT 1".into()) .expect ("!select 1");
-    cluster.execute ("SELECT 2".into()) .expect ("!select 2");
-    cluster.execute ("SELECT 3".into()) .expect ("!select 3");}
+  let mut results = Vec::new();
 
-  println! ("Final sleep.");
-  std::thread::sleep (std::time::Duration::from_secs (1));
-  println! ("Bye.");}
+  for _ in 0..10 {
+    results.push ((1, cluster.execute ("SELECT 1".into()) .expect ("!select 1")));
+    results.push ((2, cluster.execute ("SELECT 2".into()) .expect ("!select 2")));
+    results.push ((3, cluster.execute ("SELECT 3".into()) .expect ("!select 3")));}
+
+  for (expect, pr) in results {
+    let pr: PgResult = pr.wait().expect ("!pr");
+    let value = unsafe {CStr::from_ptr (pq::PQgetvalue (pr.0, 0, 0))} .to_str() .expect ("!value");
+    assert_eq! (expect, value.parse().unwrap());}}
