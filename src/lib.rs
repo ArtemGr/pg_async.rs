@@ -31,7 +31,7 @@ use std::thread::JoinHandle;
 
 #[cfg(test)] mod tests;
 
-pub struct PgResult (*mut pq::PGresult);
+pub struct PgResult (pub *mut pq::PGresult);
 
 // cf. https://www.postgresql.org/docs/9.4/static/libpq-threading.html
 unsafe impl Sync for PgResult {}
@@ -85,6 +85,12 @@ impl Future for PgFuture {
     let mut res = None;
     std::mem::swap (&mut res, &mut sync.res);
     let res = res.unwrap();
+
+    let status = unsafe {pq::PQresultStatus (res.0)};
+    if status != pq::PGRES_COMMAND_OK && status != pq::PGRES_TUPLES_OK {
+      let status = try_s! (unsafe {CStr::from_ptr (pq::PQresStatus (status))} .to_str());
+      let err = try_s! (unsafe {CStr::from_ptr (pq::PQresultErrorMessage (res.0))} .to_str());
+      return ERR! ("!OK; {}; {}", status, err);}
 
     Ok (Async::Ready (res))}}
 
@@ -328,6 +334,8 @@ pub mod pq {  // cf. "bindgen /usr/include/postgresql/libpq-fe.h".
     pub fn PQgetResult (conn: *mut PGconn) -> *mut PGresult;
     /// https://www.postgresql.org/docs/9.4/static/libpq-exec.html#LIBPQ-PQRESULTSTATUS
     pub fn PQresultStatus (res: *const PGresult) -> ExecStatusType;
+    /// https://www.postgresql.org/docs/9.4/static/libpq-exec.html#LIBPQ-PQRESSTATUS
+    pub fn PQresStatus (status: ExecStatusType) -> *mut c_char;
     /// https://www.postgresql.org/docs/9.4/static/libpq-exec.html#LIBPQ-PQRESULTERRORMESSAGE
     pub fn PQresultErrorMessage (res: *const PGresult) -> *mut c_char;
     /// https://www.postgresql.org/docs/9.4/static/libpq-exec.html#LIBPQ-PQNTUPLES

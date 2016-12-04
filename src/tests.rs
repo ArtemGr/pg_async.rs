@@ -8,8 +8,7 @@ lazy_static! {
 
 #[test] fn select1() {
   let mut cluster = Cluster::new() .expect ("!Cluster");
-  for dsn in DSNS.iter() {
-    cluster.connect (dsn.clone(), 1) .expect ("!connect")}
+  for dsn in DSNS.iter() {cluster.connect (dsn.clone(), 1) .expect ("!connect")}
 
   let mut results = Vec::new();
 
@@ -22,3 +21,11 @@ lazy_static! {
     let pr: PgResult = pr.wait().expect ("!pr");
     let value = unsafe {CStr::from_ptr (pq::PQgetvalue (pr.0, 0, 0))} .to_str() .expect ("!value");
     assert_eq! (expect, value.parse().unwrap());}}
+
+#[test] fn error() {
+  let mut cluster = Cluster::new() .expect ("!Cluster");
+  for dsn in DSNS.iter() {cluster.connect (dsn.clone(), 1) .expect ("!connect")}
+  let f = cluster.execute ("SELECT abrakadabra".into()) .expect ("!execute");
+  match f.wait() {
+    Err (ref err) if err.contains ("PGRES_FATAL_ERROR") => (),  // Expected error.
+    x => panic! ("Unexpected result (no error?): {:?}", x)}}
