@@ -19,8 +19,7 @@ lazy_static! {
 
   for (expect, pr) in results {
     let pr: PgResult = pr.wait().expect ("!pr");
-    let value = unsafe {CStr::from_ptr (pq::PQgetvalue (pr.0, 0, 0))} .to_str() .expect ("!value");
-    assert_eq! (expect, value.parse().unwrap());}}
+    assert_eq! (expect, pr.row (0) .col_str (0) .unwrap().parse().unwrap());}}
 
 #[test] fn error() {
   let mut cluster = Cluster::new() .expect ("!Cluster");

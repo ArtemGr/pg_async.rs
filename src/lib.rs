@@ -31,7 +31,20 @@ use std::thread::JoinHandle;
 
 #[cfg(test)] mod tests;
 
-pub struct PgResult (pub *mut pq::PGresult);
+pub struct PgRow<'a> (&'a PgResult, u32);
+
+impl<'a> PgRow<'a> {
+  pub fn col (&self, column: u32) -> &'a [u8] {
+    if column > self.0.columns {panic! ("Column index {} is out of range (0..{})", column, self.0.columns)}
+    unsafe {CStr::from_ptr (pq::PQgetvalue ((self.0).res, self.1 as c_int, column as c_int))} .to_bytes()}
+  pub fn col_str (&self, column: u32) -> Result<&'a str, std::str::Utf8Error> {
+    if column > self.0.columns {panic! ("Column index {} is out of range (0..{})", column, self.0.columns)}
+    unsafe {CStr::from_ptr (pq::PQgetvalue ((self.0).res, self.1 as c_int, column as c_int))} .to_str()}}
+
+pub struct PgResult {
+  pub res: *mut pq::PGresult,
+  pub rows: u32,
+  pub columns: u32}
 
 // cf. https://www.postgresql.org/docs/9.4/static/libpq-threading.html
 unsafe impl Sync for PgResult {}
@@ -39,12 +52,19 @@ unsafe impl Send for PgResult {}
 
 impl Drop for PgResult {
   fn drop (&mut self) {
-    assert! (self.0 != null_mut());
-    unsafe {pq::PQclear (self.0)}}}
+    assert! (self.res != null_mut());
+    unsafe {pq::PQclear (self.res)}}}
 
 impl fmt::Debug for PgResult {
   fn fmt (&self, ft: &mut fmt::Formatter) -> Result<(), fmt::Error> {
     write! (ft, "PgResult")}}
+
+impl PgResult {
+  pub fn is_empty (&self) -> bool {self.rows == 0}
+  pub fn len (&self) -> u32 {self.rows}
+  pub fn row (&self, row: u32) -> PgRow {
+    if row >= self.rows {panic! ("Row index {} is out of range (0..{})", row, self.rows)}
+    PgRow (self, row)}}
 
 struct PgFutureSync {
   res: Option<PgResult>,
@@ -86,10 +106,10 @@ impl Future for PgFuture {
     std::mem::swap (&mut res, &mut sync.res);
     let res = res.unwrap();
 
-    let status = unsafe {pq::PQresultStatus (res.0)};
+    let status = unsafe {pq::PQresultStatus (res.res)};
     if status != pq::PGRES_COMMAND_OK && status != pq::PGRES_TUPLES_OK {
       let status = try_s! (unsafe {CStr::from_ptr (pq::PQresStatus (status))} .to_str());
-      let err = try_s! (unsafe {CStr::from_ptr (pq::PQresultErrorMessage (res.0))} .to_str());
+      let err = try_s! (unsafe {CStr::from_ptr (pq::PQresultErrorMessage (res.res))} .to_str());
       return ERR! ("!OK; {}; {}", status, err);}
 
     Ok (Async::Ready (res))}}
@@ -185,7 +205,10 @@ fn event_loop (rx: Receiver<Message>, read_end: c_int) {
             break}
           let pg_future = conn.in_flight.pop_front().expect ("!pop_front");
           let mut sync = pg_future.0.sync.lock().expect ("!lock");
-          sync.res = Some (PgResult (res));
+          sync.res = Some (PgResult {
+            res: res,
+            rows: unsafe {pq::PQntuples (res)} as u32,
+            columns: unsafe {pq::PQnfields (res)} as u32});
           if let Some (ref task) = sync.task {task.unpark()}}
 
         fds.push (PollFd::new (sock, poll::POLLIN, EventFlags::empty()))}}
