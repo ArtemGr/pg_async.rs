@@ -252,7 +252,7 @@ impl Cluster {
   /// * `dsn` - A keyword=value [connection string](https://www.postgresql.org/docs/9.4/static/libpq-connect.html#LIBPQ-CONNSTRING).
   /// * `mul` - Pipelining support in `libpq` is currently limited to one batch of queries per connection,
   ///           but parallelism can be increased by adding the same connection several times.
-  pub fn connect (&mut self, dsn: String, mul: u8) -> Result<(), String> {
+  pub fn connect (&self, dsn: String, mul: u8) -> Result<(), String> {
     try_s! (self.tx.send (Message::Connect (dsn, mul)));
     try_s! (nix::unistd::write (self.write_end, &[1]));
     Ok(())}
@@ -266,7 +266,7 @@ impl Cluster {
   /// (CTEs might be used as a workaround, cf.
   ///  https://www.postgresql.org/docs/9.4/static/queries-with.html#QUERIES-WITH-MODIFYING,
   ///  https://omniti.com/seeds/writable-ctes-improve-performance).
-  pub fn execute (&mut self, sql: String) -> Result<PgFuture, String> {
+  pub fn execute (&self, sql: String) -> Result<PgFuture, String> {
     self.command_num.compare_and_swap (u64::max_value(), 0, Ordering::Relaxed);  // Recycle the set of identifiers.
     let id = self.command_num.fetch_add (1, Ordering::Relaxed) + 1;
     let pg_future = PgFuture::new (id, sql);

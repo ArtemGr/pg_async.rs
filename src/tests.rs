@@ -7,7 +7,7 @@ lazy_static! {
     .lines().collect() :Result<Vec<String>, _>) .expect ("!pg_async.dsns");}
 
 #[test] fn select1() {
-  let mut cluster = Cluster::new() .expect ("!Cluster");
+  let cluster = Cluster::new() .expect ("!Cluster");
   for dsn in DSNS.iter() {cluster.connect (dsn.clone(), 1) .expect ("!connect")}
 
   let mut results = Vec::new();
@@ -22,7 +22,7 @@ lazy_static! {
     assert_eq! (expect, pr.row (0) .col_str (0) .unwrap().parse().unwrap());}}
 
 #[test] fn error() {
-  let mut cluster = Cluster::new() .expect ("!Cluster");
+  let cluster = Cluster::new() .expect ("!Cluster");
   for dsn in DSNS.iter() {cluster.connect (dsn.clone(), 1) .expect ("!connect")}
   let f = cluster.execute ("SELECT abrakadabra".into()) .expect ("!execute");
   match f.wait() {
