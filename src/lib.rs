@@ -50,6 +50,15 @@ pub struct PgResult {
 unsafe impl Sync for PgResult {}
 unsafe impl Send for PgResult {}
 
+impl PgResult {
+  pub fn is_empty (&self) -> bool {self.rows == 0}
+  pub fn len (&self) -> u32 {self.rows}
+  pub fn row (&self, row: u32) -> PgRow {
+    if row >= self.rows {panic! ("Row index {} is out of range (0..{})", row, self.rows)}
+    PgRow (self, row)}
+  pub fn iter<'a> (&'a self) -> PgResultIt<'a> {
+    PgResultIt {pr: self, row: 0}}}
+
 impl Drop for PgResult {
   fn drop (&mut self) {
     assert! (self.res != null_mut());
@@ -59,12 +68,16 @@ impl fmt::Debug for PgResult {
   fn fmt (&self, ft: &mut fmt::Formatter) -> Result<(), fmt::Error> {
     write! (ft, "PgResult")}}
 
-impl PgResult {
-  pub fn is_empty (&self) -> bool {self.rows == 0}
-  pub fn len (&self) -> u32 {self.rows}
-  pub fn row (&self, row: u32) -> PgRow {
-    if row >= self.rows {panic! ("Row index {} is out of range (0..{})", row, self.rows)}
-    PgRow (self, row)}}
+/// An `Iterator` over `PgResult` rows.
+pub struct PgResultIt<'a> {pr: &'a PgResult, row: u32}
+impl<'a> Iterator for PgResultIt<'a> {
+  type Item = PgRow<'a>;
+  fn next (&mut self) -> Option<PgRow<'a>> {
+    if self.row < self.pr.rows {
+      let row = PgRow (self.pr, self.row);
+      self.row += 1;
+      Some (row)
+    } else {None}}}
 
 struct PgFutureSync {
   res: Option<PgResult>,
