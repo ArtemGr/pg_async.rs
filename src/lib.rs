@@ -15,7 +15,7 @@ extern crate serde_json;
 
 use futures::{Future, Poll, Async};
 use futures::task::{park, Task};
-use libc::c_int;
+use libc::{c_char, c_int, c_void};
 use nix::poll::{self, EventFlags, PollFd};
 use nix::fcntl::{O_NONBLOCK, O_CLOEXEC};
 //use serde_json::{Value as Json};
@@ -30,6 +30,32 @@ use std::sync::mpsc::{channel, Sender, Receiver, TryRecvError};
 use std::thread::JoinHandle;
 
 #[cfg(test)] mod tests;
+
+/// A part of an SQL query text. The query is constructed by adding `Plain` pieces "as is" and escaping the `Literal` pieces.
+///
+/// For example, `vec! [PgQueryPiece::Plain ("SELECT ".into()), PgQueryPiece::Literal ("foo".into)]` becomes "SELECT 'foo'".
+#[derive(Debug)]
+pub enum PgQueryPiece {
+  /// Static strings are included in the query "as is".
+  Static (&'static str),
+  /// Plain strings are included in the query "as is".
+  Plain (String),
+  /// Literals are escaped with `PQescapeLiteral` (which also places them into the single quotes).
+  Literal (String)}
+
+pub trait IntoQueryPieces {
+  fn into_query_pieces (self) -> Vec<PgQueryPiece>;}
+
+impl IntoQueryPieces for String {
+  fn into_query_pieces (self) -> Vec<PgQueryPiece> {
+    vec! [PgQueryPiece::Plain (self)]}}
+
+impl IntoQueryPieces for &'static str {
+  fn into_query_pieces (self) -> Vec<PgQueryPiece> {
+    vec! [PgQueryPiece::Static (self)]}}
+
+impl<'a> IntoQueryPieces for Vec<PgQueryPiece> {
+  fn into_query_pieces (self) -> Vec<PgQueryPiece> {self}}
 
 pub struct PgRow<'a> (&'a PgResult, u32);
 
@@ -85,7 +111,7 @@ struct PgFutureSync {
 
 struct PgFutureImpl {
   id: u64,
-  sql: String,
+  sql: Vec<PgQueryPiece>,
   sync: Mutex<PgFutureSync>}
 
 /// Delayed SQL result.
@@ -93,7 +119,7 @@ struct PgFutureImpl {
 pub struct PgFuture (Arc<PgFutureImpl>);
 
 impl PgFuture {
-  fn new (id: u64, sql: String) -> PgFuture {
+  fn new (id: u64, sql: Vec<PgQueryPiece>) -> PgFuture {
     PgFuture (Arc::new (PgFutureImpl {
       id: id,
       sql: sql,
@@ -103,7 +129,7 @@ impl PgFuture {
 
 impl fmt::Debug for PgFuture {
   fn fmt (&self, ft: &mut fmt::Formatter) -> Result<(), fmt::Error> {
-    write! (ft, "PgFuture ({}, {})", self.0.id, self.0.sql)}}
+    write! (ft, "PgFuture ({}, {:?})", self.0.id, self.0.sql)}}
 
 impl Future for PgFuture {
   type Item = PgResult;
@@ -147,7 +173,8 @@ fn event_loop (rx: Receiver<Message>, read_end: c_int) {
   let mut pending_connections: Vec<*mut pq::PGconn> = Vec::new();
   let mut good_connections: Vec<Connection> = Vec::new();
   let mut fds = Vec::new();
-  let mut pending_sqls = Vec::new();
+  let mut pending_futures = Vec::new();
+  let mut sql = String::with_capacity (4096);
   'event_loop: loop {
     { let mut tmp: [u8; 256] = unsafe {std::mem::uninitialized()}; let _ = nix::unistd::read (read_end, &mut tmp); }
     loop {match rx.try_recv() {
@@ -161,7 +188,7 @@ fn event_loop (rx: Receiver<Message>, read_end: c_int) {
             let conn = unsafe {pq::PQconnectStart (dsn.as_ptr())};
             if conn == null_mut() {panic! ("!PQconnectStart")}
             pending_connections.push (conn);}},
-        Message::Execute (sql) => pending_sqls.push (sql),
+        Message::Execute (pg_future) => pending_futures.push (pg_future),
         Message::Drop => break 'event_loop}}}  // Cluster is dropping.
 
     fds.clear();
@@ -184,7 +211,7 @@ fn event_loop (rx: Receiver<Message>, read_end: c_int) {
           pq::PGRES_POLLING_WRITING => fds.push (PollFd::new (sock, poll::POLLOUT, EventFlags::empty())),
           _ => ()};}}
 
-    if !pending_sqls.is_empty() {
+    if !pending_futures.is_empty() {
       // Try to find a connection that isn't currently busy.
       // (As of now, only one `PQsendQuery` can be in flight).
       if let Some (conn) = good_connections.iter_mut().find (|conn| conn.in_flight.is_empty()) {
@@ -192,14 +219,23 @@ fn event_loop (rx: Receiver<Message>, read_end: c_int) {
         // Similar to how libpqxx pipelining works, cf.
         // https://github.com/jtv/libpqxx/blob/master/include/pqxx/pipeline.hxx
         // https://github.com/jtv/libpqxx/blob/master/src/pipeline.cxx
-        let mut sql = String::with_capacity (pending_sqls.iter().map (|en| en.0.sql.len()) .sum::<usize>() + (2 * pending_sqls.len()));
-        for pending in pending_sqls.iter() {
+        sql.clear();
+        for pending in pending_futures.iter() {
           if !sql.is_empty() {sql.push_str ("; ")}
-          sql.push_str (&pending.0.sql);}
-        let sql = CString::new (sql) .expect ("!sql");
+          for piece in pending.0.sql.iter() {
+            match piece {
+              &PgQueryPiece::Static (ref ss) => sql.push_str (ss),
+              &PgQueryPiece::Plain (ref plain) => sql.push_str (&plain),
+              &PgQueryPiece::Literal (ref literal) => {
+                let esc = unsafe {pq::PQescapeLiteral (conn.conn, literal.as_ptr() as *const c_char, literal.len())};
+                if esc == null_mut() {panic! ("!PQescapeLiteral: {}", error_message (conn.conn))}
+                sql.push_str (unsafe {CStr::from_ptr (esc)} .to_str().expect ("!esc"));
+                unsafe {pq::PQfreemem (esc as *mut c_void)};}}}}
+
+        let sql = CString::new (&sql[..]) .expect ("!sql");
         let rc = unsafe {pq::PQsendQuery (conn.conn, sql.as_ptr())};
         if rc == 0 {panic! ("!PQsendQuery: {}", error_message (conn.conn))}
-        conn.in_flight.extend (pending_sqls.drain (..));}}
+        conn.in_flight.extend (pending_futures.drain (..));}}
 
     for conn in good_connections.iter_mut() {
       if !conn.in_flight.is_empty() {
@@ -279,10 +315,10 @@ impl Cluster {
   /// (CTEs might be used as a workaround, cf.
   ///  https://www.postgresql.org/docs/9.4/static/queries-with.html#QUERIES-WITH-MODIFYING,
   ///  https://omniti.com/seeds/writable-ctes-improve-performance).
-  pub fn execute (&self, sql: String) -> Result<PgFuture, String> {
+  pub fn execute<I: IntoQueryPieces> (&self, sql: I) -> Result<PgFuture, String> {
     self.command_num.compare_and_swap (u64::max_value(), 0, Ordering::Relaxed);  // Recycle the set of identifiers.
     let id = self.command_num.fetch_add (1, Ordering::Relaxed) + 1;
-    let pg_future = PgFuture::new (id, sql);
+    let pg_future = PgFuture::new (id, sql.into_query_pieces());
 
     try_s! (self.tx.send (Message::Execute (pg_future.clone())));
     try_s! (nix::unistd::write (self.write_end, &[2]));
@@ -303,7 +339,7 @@ fn error_message (conn: *const pq::PGconn) -> String {
 
 /// FFI bindings to `libpq`.
 pub mod pq {  // cf. "bindgen /usr/include/postgresql/libpq-fe.h".
-  use libc::{c_char, c_int, c_uint};
+  use libc::{c_char, c_int, c_uint, c_void, size_t};
 
   pub enum PGconn {}
 
@@ -358,6 +394,10 @@ pub mod pq {  // cf. "bindgen /usr/include/postgresql/libpq-fe.h".
     pub fn PQsetnonblocking (conn: *mut PGconn, arg: c_int) -> c_int;
     /// https://www.postgresql.org/docs/9.4/static/libpq-connect.html#LIBPQ-PQFINISH
     pub fn PQfinish (conn: *mut PGconn);
+    /// https://www.postgresql.org/docs/9.4/static/libpq-exec.html#LIBPQ-EXEC-ESCAPE-STRING
+    pub fn PQescapeLiteral (conn: *mut PGconn, str: *const c_char, len: size_t) -> *mut c_char;
+    /// https://www.postgresql.org/docs/9.4/static/libpq-misc.html#LIBPQ-PQFREEMEM
+    pub fn PQfreemem (ptr: *mut c_void);
     /// https://www.postgresql.org/docs/9.4/static/libpq-async.html#LIBPQ-PQSENDQUERY
     pub fn PQsendQuery (conn: *mut PGconn, command: *const c_char) -> c_int;
     /// https://www.postgresql.org/docs/9.4/static/libpq-async.html#LIBPQ-PQFLUSH
