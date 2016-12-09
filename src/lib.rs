@@ -24,6 +24,7 @@ use std::ffi::{CString, CStr};
 use std::fmt;
 use std::io;
 use std::ptr::null_mut;
+use std::slice::from_raw_parts;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Sender, Receiver, TryRecvError};
@@ -60,9 +61,21 @@ impl<'a> IntoQueryPieces for Vec<PgQueryPiece> {
 pub struct PgRow<'a> (&'a PgResult, u32);
 
 impl<'a> PgRow<'a> {
+  /// True if the value is NULL.
+  pub fn is_null (&self, column: u32) -> bool {
+    if column > self.0.columns {panic! ("Column index {} is out of range (0..{})", column, self.0.columns)}
+    1 == unsafe {pq::PQgetisnull ((self.0).res, self.1 as c_int, column as c_int)}}
+  /// PostgreSQL internal OID number of the column type.
+  pub fn ftype (&self, column: u32) -> pq::Oid {
+    if column > self.0.columns {panic! ("Column index {} is out of range (0..{})", column, self.0.columns)}
+    unsafe {pq::PQftype ((self.0).res, column as c_int)}}
+  /// Returns an empty array if the value is NULL.
   pub fn col (&self, column: u32) -> &'a [u8] {
     if column > self.0.columns {panic! ("Column index {} is out of range (0..{})", column, self.0.columns)}
-    unsafe {CStr::from_ptr (pq::PQgetvalue ((self.0).res, self.1 as c_int, column as c_int))} .to_bytes()}
+    let len = unsafe {pq::PQgetlength ((self.0).res, self.1 as c_int, column as c_int)};
+    let val = unsafe {pq::PQgetvalue ((self.0).res, self.1 as c_int, column as c_int)};
+    unsafe {from_raw_parts (val as *const u8, len as usize)}}
+  /// Returns an empty string if the value is NULL.
   pub fn col_str (&self, column: u32) -> Result<&'a str, std::str::Utf8Error> {
     if column > self.0.columns {panic! ("Column index {} is out of range (0..{})", column, self.0.columns)}
     unsafe {CStr::from_ptr (pq::PQgetvalue ((self.0).res, self.1 as c_int, column as c_int))} .to_str()}}
@@ -77,11 +90,18 @@ unsafe impl Sync for PgResult {}
 unsafe impl Send for PgResult {}
 
 impl PgResult {
+  /// True if there is no rows in the result.
   pub fn is_empty (&self) -> bool {self.rows == 0}
+  /// Number of rows.
   pub fn len (&self) -> u32 {self.rows}
+  /// PostgreSQL internal OID number of the column type.
+  pub fn ftype (&self, column: u32) -> pq::Oid {
+    if column > self.columns {panic! ("Column index {} is out of range (0..{})", column, self.columns)}
+    unsafe {pq::PQftype (self.res, column as c_int)}}
   pub fn row (&self, row: u32) -> PgRow {
     if row >= self.rows {panic! ("Row index {} is out of range (0..{})", row, self.rows)}
     PgRow (self, row)}
+  /// Iterator over result rows.
   pub fn iter<'a> (&'a self) -> PgResultIt<'a> {
     PgResultIt {pr: self, row: 0}}}
 
@@ -505,12 +525,12 @@ pub mod pq {  // cf. "bindgen /usr/include/postgresql/libpq-fe.h".
     pub fn PQfname (res: *const PGresult, field_num: c_int) -> *mut c_char;
     /// https://www.postgresql.org/docs/9.4/static/libpq-exec.html#LIBPQ-PQFTYPE
     pub fn PQftype (res: *const PGresult, field_num: c_int) -> Oid;
+    /// https://www.postgresql.org/docs/9.4/static/libpq-exec.html#LIBPQ-PQGETISNULL
+    pub fn PQgetisnull (res: *const PGresult, tup_num: c_int, field_num: c_int) -> c_int;
     /// https://www.postgresql.org/docs/9.4/static/libpq-exec.html#LIBPQ-PQGETVALUE
     pub fn PQgetvalue (res: *const PGresult, tup_num: c_int, field_num: c_int) -> *mut c_char;
     /// https://www.postgresql.org/docs/9.4/static/libpq-exec.html#LIBPQ-PQGETLENGTH
     pub fn PQgetlength (res: *const PGresult, tup_num: c_int, field_num: c_int) -> c_int;
-    /// https://www.postgresql.org/docs/9.4/static/libpq-exec.html#LIBPQ-PQGETISNULL
-    pub fn PQgetisnull (res: *const PGresult, tup_num: c_int, field_num: c_int) -> c_int;
     /// https://www.postgresql.org/docs/9.4/static/libpq-exec.html#LIBPQ-PQCMDSTATUS
     pub fn PQcmdStatus (res: *mut PGresult) -> *mut c_char;
     /// https://www.postgresql.org/docs/9.4/static/libpq-exec.html#LIBPQ-PQCMDTUPLES
