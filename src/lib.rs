@@ -162,7 +162,21 @@ enum Message {
 #[derive(Debug)]
 struct Connection {
   conn: *mut pq::PGconn,
-  in_flight: VecDeque<PgFuture>}
+  in_flight: VecDeque<PgFuture>,
+  /// The number of tuning commands we've sent privately.
+  in_flight_init: u8}
+
+impl Connection {
+  fn free (&self) -> bool {
+    self.in_flight.is_empty() && self.in_flight_init == 0}}
+
+// TODO: Fetch the entire pipeline results first and unpark the futures second.
+// That way we could notify the DML futures that the pipeline has failed and the modifications weren't committed.
+
+// Limit the size of the pipeline. This is especially important in the presence of errors,
+// because we have to reschedule the majority of the commands after an error.
+const PIPELINE_LIM_COMMANDS: usize = 128;
+const PIPELINE_LIM_BYTES: usize = 16384;
 
 fn event_loop (rx: Receiver<Message>, read_end: c_int) {
   // NB: Connection must not leak into other threads.
@@ -173,8 +187,9 @@ fn event_loop (rx: Receiver<Message>, read_end: c_int) {
   let mut pending_connections: Vec<*mut pq::PGconn> = Vec::new();
   let mut good_connections: Vec<Connection> = Vec::new();
   let mut fds = Vec::new();
-  let mut pending_futures = Vec::new();
-  let mut sql = String::with_capacity (4096);
+  let mut pending_futures = VecDeque::new();
+  let mut sql = String::with_capacity (PIPELINE_LIM_BYTES + 1024);
+  let mut sql_futures = Vec::with_capacity (PIPELINE_LIM_COMMANDS);
   'event_loop: loop {
     { let mut tmp: [u8; 256] = unsafe {std::mem::uninitialized()}; let _ = nix::unistd::read (read_end, &mut tmp); }
     loop {match rx.try_recv() {
@@ -188,7 +203,7 @@ fn event_loop (rx: Receiver<Message>, read_end: c_int) {
             let conn = unsafe {pq::PQconnectStart (dsn.as_ptr())};
             if conn == null_mut() {panic! ("!PQconnectStart")}
             pending_connections.push (conn);}},
-        Message::Execute (pg_future) => pending_futures.push (pg_future),
+        Message::Execute (pg_future) => pending_futures.push_back (pg_future),
         Message::Drop => break 'event_loop}}}  // Cluster is dropping.
 
     fds.clear();
@@ -197,12 +212,20 @@ fn event_loop (rx: Receiver<Message>, read_end: c_int) {
       let conn: *mut pq::PGconn = pending_connections[idx];
       let status = unsafe {pq::PQstatus (conn)};
       if status == pq::CONNECTION_BAD {
-        println! ("CONNECTION_BAD: {}", error_message (conn));
-        pending_connections.remove (idx);
+        panic! ("CONNECTION_BAD: {}", error_message (conn));
+        //pending_connections.remove (idx);
       } else if status == pq::CONNECTION_OK {
         let rc = unsafe {pq::PQsetnonblocking (conn, 1)};
         if rc != 0 {panic! ("!PQsetnonblocking: {}", error_message (conn))}
-        good_connections.push (Connection {conn: conn, in_flight: VecDeque::new()});
+
+        // Pipelining usually works by executing all queries in a single transaction, but we might want to avoid that
+        // because we don't want a single failing query to invalidate (roll back) all DMLs that happen to share the same pipeline.
+        // This means we might be wrapping each query in a transaction
+        // and need some other means to amortize the const of many transactions being present in the pipeline.
+        let rc = unsafe {pq::PQsendQuery (conn, "SET synchronous_commit = off\0".as_ptr() as *const c_char)};
+        if rc == 0 {panic! ("!PQsendQuery: {}", error_message (conn))}
+
+        good_connections.push (Connection {conn: conn, in_flight: VecDeque::new(), in_flight_init: 1});
         pending_connections.remove (idx);
       } else {
         let sock = unsafe {pq::PQsocket (conn)};
@@ -211,34 +234,43 @@ fn event_loop (rx: Receiver<Message>, read_end: c_int) {
           pq::PGRES_POLLING_WRITING => fds.push (PollFd::new (sock, poll::POLLOUT, EventFlags::empty())),
           _ => ()};}}
 
-    if !pending_futures.is_empty() {
-      // Try to find a connection that isn't currently busy.
-      // (As of now, only one `PQsendQuery` can be in flight).
-      if let Some (conn) = good_connections.iter_mut().find (|conn| conn.in_flight.is_empty()) {
-        // Join all the queries into a single batch.
-        // Similar to how libpqxx pipelining works, cf.
-        // https://github.com/jtv/libpqxx/blob/master/include/pqxx/pipeline.hxx
-        // https://github.com/jtv/libpqxx/blob/master/src/pipeline.cxx
-        sql.clear();
-        for pending in pending_futures.iter() {
-          if !sql.is_empty() {sql.push_str ("; ")}
-          for piece in pending.0.sql.iter() {
-            match piece {
-              &PgQueryPiece::Static (ref ss) => sql.push_str (ss),
-              &PgQueryPiece::Plain (ref plain) => sql.push_str (&plain),
-              &PgQueryPiece::Literal (ref literal) => {
-                let esc = unsafe {pq::PQescapeLiteral (conn.conn, literal.as_ptr() as *const c_char, literal.len())};
-                if esc == null_mut() {panic! ("!PQescapeLiteral: {}", error_message (conn.conn))}
-                sql.push_str (unsafe {CStr::from_ptr (esc)} .to_str().expect ("!esc"));
-                unsafe {pq::PQfreemem (esc as *mut c_void)};}}}}
+    // Try to find a connection that isn't currently busy.
+    // (As of now, only one `PQsendQuery` can be in flight).
+    for conn in good_connections.iter_mut().filter (|conn| conn.free()) {
+      if pending_futures.is_empty() {break}
+      // Join all the queries into a single batch.
+      // Similar to how libpqxx pipelining works, cf.
+      // https://github.com/jtv/libpqxx/blob/master/include/pqxx/pipeline.hxx
+      // https://github.com/jtv/libpqxx/blob/master/src/pipeline.cxx
+      sql.clear();
+      sql_futures.clear();
+      loop {
+        if sql.len() >= PIPELINE_LIM_BYTES {break}
+        if sql_futures.len() + 1 >= PIPELINE_LIM_COMMANDS {break}
+        let pending = match pending_futures.pop_front() {Some (f) => f, None => break};
+        if !sql.is_empty() {sql.push_str ("; ")}
+        for piece in pending.0.sql.iter() {
+          match piece {
+            &PgQueryPiece::Static (ref ss) => sql.push_str (ss),
+            &PgQueryPiece::Plain (ref plain) => sql.push_str (&plain),
+            &PgQueryPiece::Literal (ref literal) => {
+              let esc = unsafe {pq::PQescapeLiteral (conn.conn, literal.as_ptr() as *const c_char, literal.len())};
+              if esc == null_mut() {panic! ("!PQescapeLiteral: {}", error_message (conn.conn))}
+              sql.push_str (unsafe {CStr::from_ptr (esc)} .to_str().expect ("!esc"));
+              unsafe {pq::PQfreemem (esc as *mut c_void)};}}}
+        sql_futures.push (pending)}
 
-        let sql = CString::new (&sql[..]) .expect ("!sql");
-        let rc = unsafe {pq::PQsendQuery (conn.conn, sql.as_ptr())};
-        if rc == 0 {panic! ("!PQsendQuery: {}", error_message (conn.conn))}
-        conn.in_flight.extend (pending_futures.drain (..));}}
+      // NB: We need this call to flip a flag in libpq, particularly when the loop that process the results finishes early.
+      let res = unsafe {pq::PQgetResult (conn.conn)};
+      if res != null_mut() {panic! ("Stray result detected before PQsendQuery! {:?}", res);}
+
+      let sql = CString::new (&sql[..]) .expect ("!sql");
+      let rc = unsafe {pq::PQsendQuery (conn.conn, sql.as_ptr())};
+      if rc == 0 {panic! ("!PQsendQuery: {}", error_message (conn.conn))}
+      conn.in_flight.extend (sql_futures.drain (..));}
 
     for conn in good_connections.iter_mut() {
-      if !conn.in_flight.is_empty() {
+      if !conn.free() {
         let sock = unsafe {pq::PQsocket (conn.conn)};
 
         let rc = unsafe {pq::PQconsumeInput (conn.conn)};
@@ -248,17 +280,26 @@ fn event_loop (rx: Receiver<Message>, read_end: c_int) {
         if rc == 1 {fds.push (PollFd::new (sock, poll::POLLOUT, EventFlags::empty()))}
 
         loop {
+          if unsafe {pq::PQisBusy (conn.conn)} == 1 {break}
           let res = unsafe {pq::PQgetResult (conn.conn)};
           if res == null_mut() {
-            assert! (conn.in_flight.is_empty(), "leftovers: {:?}", conn.in_flight);
+            if !conn.in_flight.is_empty() {panic! ("leftovers: {:?}", conn.in_flight);}
             break}
-          let pg_future = conn.in_flight.pop_front().expect ("!pop_front");
-          let mut sync = pg_future.0.sync.lock().expect ("!lock");
-          sync.res = Some (PgResult {
-            res: res,
-            rows: unsafe {pq::PQntuples (res)} as u32,
-            columns: unsafe {pq::PQnfields (res)} as u32});
-          if let Some (ref task) = sync.task {task.unpark()}}
+          if conn.in_flight_init != 0 {
+            conn.in_flight_init -= 1
+          } else {
+            let pg_future = conn.in_flight.pop_front().expect ("!pop_front");
+            let mut sync = pg_future.0.sync.lock().expect ("!lock");
+            sync.res = Some (PgResult {
+              res: res,
+              rows: unsafe {pq::PQntuples (res)} as u32,
+              columns: unsafe {pq::PQnfields (res)} as u32});
+            if let Some (ref task) = sync.task {task.unpark()}}
+
+          // If one query fails then the entire pipeline fails?
+          let status = unsafe {pq::PQresultStatus (res)};
+          if status != pq::PGRES_COMMAND_OK && status != pq::PGRES_TUPLES_OK {
+            pending_futures.extend (conn.in_flight.drain (..));}}  // Reschedule remaining futures.
 
         fds.push (PollFd::new (sock, poll::POLLIN, EventFlags::empty()))}}
 

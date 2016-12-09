@@ -27,4 +27,17 @@ lazy_static! {
   let f = cluster.execute ("SELECT abrakadabra") .expect ("!execute");
   match f.wait() {
     Err (ref err) if err.contains ("PGRES_FATAL_ERROR") => (),  // Expected error.
-    x => panic! ("Unexpected result (no error?): {:?}", x)}}
+    x => panic! ("Unexpected result (no error?): {:?}", x)}
+
+  let mut ops = Vec::new();
+  for i in 0..100 {ops.push (cluster.execute (
+    if i % 10 != 0 {format! ("SELECT {}", i)} else {"SELECT abrakadabra".into()}) .expect ("!execute"))}
+  for (op, i) in ops.into_iter().zip (0..) {
+    let rc = op.wait();
+    if i % 10 != 0 {
+      let pr = rc.expect ("!op");
+      assert_eq! (i, pr.row (0) .col_str (0) .unwrap().parse().unwrap() :u32);
+    } else {
+      assert! (rc.is_err());}}}
+
+#[test] fn lack_of_durability() {}
