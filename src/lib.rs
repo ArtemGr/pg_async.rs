@@ -145,8 +145,7 @@ impl Future for PgFuture {
     std::mem::swap (&mut res, &mut sync.res);
     let res = res.unwrap();
 
-    let status = unsafe {pq::PQresultStatus (res.res)};
-    if status != pq::PGRES_COMMAND_OK && status != pq::PGRES_TUPLES_OK {
+    if let Some (status) = error_in_result (res.res) {
       let status = try_s! (unsafe {CStr::from_ptr (pq::PQresStatus (status))} .to_str());
       let err = try_s! (unsafe {CStr::from_ptr (pq::PQresultErrorMessage (res.res))} .to_str());
       return ERR! ("!OK; {}; {}", status, err);}
@@ -163,12 +162,16 @@ enum Message {
 struct Connection {
   conn: *mut pq::PGconn,
   in_flight: VecDeque<PgFuture>,
-  /// The number of tuning commands we've sent privately.
-  in_flight_init: u8}
+  /// True if there is an internal statement in flight.
+  in_flight_init: bool}
 
 impl Connection {
   fn free (&self) -> bool {
-    self.in_flight.is_empty() && self.in_flight_init == 0}}
+    self.in_flight.is_empty() && !self.in_flight_init}}
+
+fn error_in_result (res: *const pq::PGresult) -> Option<pq::ExecStatusType> {
+  let status = unsafe {pq::PQresultStatus (res)};
+  if status != pq::PGRES_COMMAND_OK && status != pq::PGRES_TUPLES_OK {Some (status)} else {None}}
 
 // TODO: Fetch the entire pipeline results first and unpark the futures second.
 // That way we could notify the DML futures that the pipeline has failed and the modifications weren't committed.
@@ -222,10 +225,12 @@ fn event_loop (rx: Receiver<Message>, read_end: c_int) {
         // because we don't want a single failing query to invalidate (roll back) all DMLs that happen to share the same pipeline.
         // This means we might be wrapping each query in a transaction
         // and need some other means to amortize the const of many transactions being present in the pipeline.
+        //
+        // BDR defaults to asynchronous commits anyway, cf. http://bdr-project.org/docs/stable/bdr-configuration-variables.html#GUC-BDR-SYNCHRONOUS-COMMIT
         let rc = unsafe {pq::PQsendQuery (conn, "SET synchronous_commit = off\0".as_ptr() as *const c_char)};
         if rc == 0 {panic! ("!PQsendQuery: {}", error_message (conn))}
 
-        good_connections.push (Connection {conn: conn, in_flight: VecDeque::new(), in_flight_init: 1});
+        good_connections.push (Connection {conn: conn, in_flight: VecDeque::new(), in_flight_init: true});
         pending_connections.remove (idx);
       } else {
         let sock = unsafe {pq::PQsocket (conn)};
@@ -244,11 +249,13 @@ fn event_loop (rx: Receiver<Message>, read_end: c_int) {
       // https://github.com/jtv/libpqxx/blob/master/src/pipeline.cxx
       sql.clear();
       sql_futures.clear();
+      let mut first = true;
       loop {
         if sql.len() >= PIPELINE_LIM_BYTES {break}
         if sql_futures.len() + 1 >= PIPELINE_LIM_COMMANDS {break}
         let pending = match pending_futures.pop_front() {Some (f) => f, None => break};
-        if !sql.is_empty() {sql.push_str ("; ")}
+        if first {first = false} else {sql.push_str ("; ")}
+        sql.push_str ("BEGIN; ");
         for piece in pending.0.sql.iter() {
           match piece {
             &PgQueryPiece::Static (ref ss) => sql.push_str (ss),
@@ -258,6 +265,8 @@ fn event_loop (rx: Receiver<Message>, read_end: c_int) {
               if esc == null_mut() {panic! ("!PQescapeLiteral: {}", error_message (conn.conn))}
               sql.push_str (unsafe {CStr::from_ptr (esc)} .to_str().expect ("!esc"));
               unsafe {pq::PQfreemem (esc as *mut c_void)};}}}
+        // Wrap every command in a separate transaction in order not to loose the DML changes when there is an erroneous statement in the pipeline.
+        sql.push_str ("; COMMIT");
         sql_futures.push (pending)}
 
       // NB: We need this call to flip a flag in libpq, particularly when the loop that process the results finishes early.
@@ -281,25 +290,58 @@ fn event_loop (rx: Receiver<Message>, read_end: c_int) {
 
         loop {
           if unsafe {pq::PQisBusy (conn.conn)} == 1 {break}
-          let res = unsafe {pq::PQgetResult (conn.conn)};
-          if res == null_mut() {
-            if !conn.in_flight.is_empty() {panic! ("leftovers: {:?}", conn.in_flight);}
-            break}
-          if conn.in_flight_init != 0 {
-            conn.in_flight_init -= 1
+          let mut error;
+          let mut after_future = false;
+          if conn.in_flight_init {
+            conn.in_flight_init = false;
+            let res = unsafe {pq::PQgetResult (conn.conn)};
+            if res == null_mut() {panic! ("Got no result for in_flight_init statement")}
+            error = error_in_result (res) .is_some()
           } else {
-            let pg_future = conn.in_flight.pop_front().expect ("!pop_front");
+            let pg_future = match conn.in_flight.pop_front() {Some (f) => f, None => break};
+            after_future = true;
+
+            // Every statement is wrapped in a "BEGIN; $statement; COMMIT" transaction and produces not one but three results.
+
+            let begin_res = unsafe {pq::PQgetResult (conn.conn)};
+            if begin_res == null_mut() {panic! ("Got no BEGIN result for {:?}", pg_future)}
+            if error_in_result (begin_res) .is_some() {panic! ("Error in BEGIN")}
+            unsafe {pq::PQclear (begin_res)}
+
+            let statement_res = unsafe {pq::PQgetResult (conn.conn)};
+            if statement_res == null_mut() {panic! ("Got no statement result for {:?}", pg_future)}
+            error = error_in_result (statement_res) .is_some();
             let mut sync = pg_future.0.sync.lock().expect ("!lock");
-            sync.res = Some (PgResult {
-              res: res,
-              rows: unsafe {pq::PQntuples (res)} as u32,
-              columns: unsafe {pq::PQnfields (res)} as u32});
+            sync.res = Some (PgResult {  // NB: `PgResult` takes responsibility to `PQclear` the `statement_res`.
+              res: statement_res,
+              rows: unsafe {pq::PQntuples (statement_res)} as u32,
+              columns: unsafe {pq::PQnfields (statement_res)} as u32});
+
+            if !error {
+              let commit_res = unsafe {pq::PQgetResult (conn.conn)};
+              if commit_res == null_mut() {panic! ("Got no COMMIT result for {:?}", pg_future)}
+              error = error_in_result (commit_res) .is_some();
+              if error {  // Share commit error with the client.
+                sync.res = Some (PgResult {res: commit_res, rows: 0, columns: 0})
+              } else {
+                unsafe {pq::PQclear (commit_res)}}}
+
             if let Some (ref task) = sync.task {task.unpark()}}
 
-          // If one query fails then the entire pipeline fails?
-          let status = unsafe {pq::PQresultStatus (res)};
-          if status != pq::PGRES_COMMAND_OK && status != pq::PGRES_TUPLES_OK {
-            pending_futures.extend (conn.in_flight.drain (..));}}  // Reschedule remaining futures.
+          if error {
+            if after_future {
+              // Need to call `PQgetResult` one last time in order to flip a flag in libpq. Otherwise `PQsendQuery` won't work.
+              let res = unsafe {pq::PQgetResult (conn.conn)};
+              if res != null_mut() {panic! ("Unexpected result after an error")}
+
+              // We're using BEGIN-COMMIT, so we should ROLLBACK after a failure.
+              // Otherwise we'll see "current transaction is aborted, commands ignored until end of transaction block".
+              let rc = unsafe {pq::PQsendQuery (conn.conn, "ROLLBACK\0".as_ptr() as *const c_char)};
+              if rc == 0 {panic! ("!PQsendQuery: {}", error_message (conn.conn))}
+              conn.in_flight_init = true}
+
+            // If a statement fails then the rest of the pipeline fails. Reschedule the remaining futures.
+            pending_futures.extend (conn.in_flight.drain (..))}}
 
         fds.push (PollFd::new (sock, poll::POLLIN, EventFlags::empty()))}}
 
