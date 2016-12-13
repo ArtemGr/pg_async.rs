@@ -26,7 +26,7 @@ lazy_static! {
   for dsn in DSNS.iter() {cluster.connect (dsn.clone(), 1) .expect ("!connect")}
   let f = cluster.execute ("SELECT abrakadabra") .expect ("!execute");
   match f.wait() {
-    Err (ref err) if err.contains ("PGRES_FATAL_ERROR") => (),  // Expected error.
+    Err (ref err) if err.description().contains ("PGRES_FATAL_ERROR") => (),  // Expected error.
     x => panic! ("Unexpected result (no error?): {:?}", x)}
 
   // Check how the presence of errors affects the pipeline.

@@ -20,6 +20,7 @@ use nix::poll::{self, EventFlags, PollFd};
 use nix::fcntl::{O_NONBLOCK, O_CLOEXEC};
 //use serde_json::{Value as Json};
 use std::collections::VecDeque;
+use std::error::Error;
 use std::ffi::{CString, CStr};
 use std::fmt;
 use std::io;
@@ -149,6 +150,29 @@ struct PgFutureImpl {
   sql: Vec<PgQueryPiece>,
   sync: Mutex<PgFutureSync>}
 
+/// Returned when an SQL operation fails. Prints the SQL in `Debug`.
+pub struct PgFutureErr {
+  /// Pointer to the failed future, which we keep in order to print the SQL in `Debug`.
+  imp: Arc<PgFutureImpl>,
+  /// Which statement has failed.
+  ///
+  /// In a single-statement ops this is usually `0` for the statement itself or `1` for the COMMIT.
+  pub num: u32,
+  /// Returned by `PQresStatus`, "string constant describing the status code".
+  pub status: &'static str,
+  pub message: String}
+
+impl fmt::Debug for PgFutureErr {
+  fn fmt (&self, ft: &mut fmt::Formatter) -> Result<(), fmt::Error> {
+    write! (ft, "PgFutureErr ({:?}, {})", self.imp.sql, self.message)}}
+
+impl fmt::Display for PgFutureErr {
+  fn fmt (&self, ft: &mut fmt::Formatter) -> Result<(), fmt::Error> {
+    ft.write_str (&self.message)}}
+
+impl Error for PgFutureErr {
+  fn description (&self) -> &str {&self.message[..]}}
+
 /// Delayed SQL result.
 #[derive(Clone)]
 pub struct PgFuture (Arc<PgFutureImpl>);
@@ -169,9 +193,9 @@ impl fmt::Debug for PgFuture {
 
 impl Future for PgFuture {
   type Item = Vec<PgResult>;
-  type Error = String;
-  fn poll (&mut self) -> Poll<Vec<PgResult>, String> {
-    let mut sync = try_s! (self.0.sync.lock());
+  type Error = Box<Error>;
+  fn poll (&mut self) -> Poll<Vec<PgResult>, Box<Error>> {
+    let mut sync = try_f! (self.0.sync.lock());
 
     if sync.results.is_empty() {
       sync.task = Some (park());
@@ -179,9 +203,13 @@ impl Future for PgFuture {
 
     for (pr, num) in sync.results.iter().zip (0..) {
       if let Some (status) = error_in_result (pr.res) {
-        let status = try_s! (unsafe {CStr::from_ptr (pq::PQresStatus (status))} .to_str());
-        let err = try_s! (unsafe {CStr::from_ptr (pq::PQresultErrorMessage (pr.res))} .to_str());
-        return ERR! ("Error in statement {}: {}; {}", num, status, err);}}
+        let status = try_f! (unsafe {CStr::from_ptr (pq::PQresStatus (status))} .to_str());
+        let err = try_f! (unsafe {CStr::from_ptr (pq::PQresultErrorMessage (pr.res))} .to_str());
+        return Err (Box::new (PgFutureErr {
+          imp: self.0.clone(),
+          num: num,
+          status: status,
+          message: format! ("Error in statement {}: {}; {}", num, status, err)}))}}
 
     let mut res = Vec::with_capacity (sync.results.len());
     res.append (&mut sync.results);
