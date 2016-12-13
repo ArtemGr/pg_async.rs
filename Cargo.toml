@@ -18,7 +18,7 @@ doctest = false
 
 [dependencies]
 futures = "0.1"
-gstuff = "0.1"
+gstuff = "0.1.5"
 itertools = "0.5"
 lazy_static = "0.2"
 libc = "0.2"
@@ -26,3 +26,12 @@ nix = "0.7"
 serde_json = "0.8"
 
 [build-dependencies]
+
+[[example]]
+name = "24x7"
+path = "examples/24x7.rs"
+
+[dev-dependencies]
+fomat-macros = "0.1"
+futures-cpupool = "0.1"
+rand = "0.3"
