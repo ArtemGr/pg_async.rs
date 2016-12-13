@@ -44,19 +44,32 @@ pub enum PgQueryPiece {
   /// Literals are escaped with `PQescapeLiteral` (which also places them into the single quotes).
   Literal (String)}
 
+/// Converts the `fn execute` input into a vector of query pieces.
 pub trait IntoQueryPieces {
-  fn into_query_pieces (self) -> Vec<PgQueryPiece>;}
+  /// Returns the number of SQL statements (the library must know how many results to expect) and the list of pieces to escape and join.
+  fn into_query_pieces (self) -> (u32, Vec<PgQueryPiece>);}
 
 impl IntoQueryPieces for String {
-  fn into_query_pieces (self) -> Vec<PgQueryPiece> {
-    vec! [PgQueryPiece::Plain (self)]}}
+  fn into_query_pieces (self) -> (u32, Vec<PgQueryPiece>) {
+    (1, vec! [PgQueryPiece::Plain (self)])}}
 
 impl IntoQueryPieces for &'static str {
-  fn into_query_pieces (self) -> Vec<PgQueryPiece> {
-    vec! [PgQueryPiece::Static (self)]}}
+  fn into_query_pieces (self) -> (u32, Vec<PgQueryPiece>) {
+    (1, vec! [PgQueryPiece::Static (self)])}}
 
 impl<'a> IntoQueryPieces for Vec<PgQueryPiece> {
-  fn into_query_pieces (self) -> Vec<PgQueryPiece> {self}}
+  fn into_query_pieces (self) -> (u32, Vec<PgQueryPiece>) {(1, self)}}
+
+impl IntoQueryPieces for (u32, &'static str) {
+  fn into_query_pieces (self) -> (u32, Vec<PgQueryPiece>) {
+    (self.0, vec! [PgQueryPiece::Static (self.1)])}}
+
+impl IntoQueryPieces for (u32, String) {
+  fn into_query_pieces (self) -> (u32, Vec<PgQueryPiece>) {
+    (self.0, vec! [PgQueryPiece::Plain (self.1)])}}
+
+impl IntoQueryPieces for (u32, Vec<PgQueryPiece>) {
+  fn into_query_pieces (self) -> (u32, Vec<PgQueryPiece>) {self}}
 
 pub struct PgRow<'a> (&'a PgResult, u32);
 
@@ -126,11 +139,13 @@ impl<'a> Iterator for PgResultIt<'a> {
     } else {None}}}
 
 struct PgFutureSync {
-  res: Option<PgResult>,
+  results: Vec<PgResult>,
   task: Option<Task>}
 
 struct PgFutureImpl {
   id: u64,
+  /// The number of separate top-level SQL statements withing the `sql`. E.g. the number of results PostgreSQL will return.
+  statements: u32,
   sql: Vec<PgQueryPiece>,
   sync: Mutex<PgFutureSync>}
 
@@ -139,12 +154,13 @@ struct PgFutureImpl {
 pub struct PgFuture (Arc<PgFutureImpl>);
 
 impl PgFuture {
-  fn new (id: u64, sql: Vec<PgQueryPiece>) -> PgFuture {
+  fn new (id: u64, statements: u32, sql: Vec<PgQueryPiece>) -> PgFuture {
     PgFuture (Arc::new (PgFutureImpl {
       id: id,
+      statements: statements,
       sql: sql,
       sync: Mutex::new (PgFutureSync {
-        res: None,
+        results: Vec::new(),
         task: None})}))}}
 
 impl fmt::Debug for PgFuture {
@@ -152,23 +168,23 @@ impl fmt::Debug for PgFuture {
     write! (ft, "PgFuture ({}, {:?})", self.0.id, self.0.sql)}}
 
 impl Future for PgFuture {
-  type Item = PgResult;
+  type Item = Vec<PgResult>;
   type Error = String;
-  fn poll (&mut self) -> Poll<PgResult, String> {
+  fn poll (&mut self) -> Poll<Vec<PgResult>, String> {
     let mut sync = try_s! (self.0.sync.lock());
 
-    if sync.res.is_none() {
+    if sync.results.is_empty() {
       sync.task = Some (park());
       return Ok (Async::NotReady)}
 
-    let mut res = None;
-    std::mem::swap (&mut res, &mut sync.res);
-    let res = res.unwrap();
+    for (pr, num) in sync.results.iter().zip (0..) {
+      if let Some (status) = error_in_result (pr.res) {
+        let status = try_s! (unsafe {CStr::from_ptr (pq::PQresStatus (status))} .to_str());
+        let err = try_s! (unsafe {CStr::from_ptr (pq::PQresultErrorMessage (pr.res))} .to_str());
+        return ERR! ("Error in statement {}: {}; {}", num, status, err);}}
 
-    if let Some (status) = error_in_result (res.res) {
-      let status = try_s! (unsafe {CStr::from_ptr (pq::PQresStatus (status))} .to_str());
-      let err = try_s! (unsafe {CStr::from_ptr (pq::PQresultErrorMessage (res.res))} .to_str());
-      return ERR! ("!OK; {}; {}", status, err);}
+    let mut res = Vec::with_capacity (sync.results.len());
+    res.append (&mut sync.results);
 
     Ok (Async::Ready (res))}}
 
@@ -206,11 +222,12 @@ fn event_loop (rx: Receiver<Message>, read_end: c_int) {
   // "One thread restriction is that no two threads attempt to manipulate the same PGconn object at the same time.
   // In particular, you cannot issue concurrent commands from different threads through the same connection object.
   // (If you need to run concurrent commands, use multiple connections.)"
+  use std::fmt::Write;
 
   let mut pending_connections: Vec<*mut pq::PGconn> = Vec::new();
   let mut good_connections: Vec<Connection> = Vec::new();
   let mut fds = Vec::new();
-  let mut pending_futures = VecDeque::new();
+  let mut pending_futures: VecDeque<PgFuture> = VecDeque::new();
   let mut sql = String::with_capacity (PIPELINE_LIM_BYTES + 1024);
   let mut sql_futures = Vec::with_capacity (PIPELINE_LIM_COMMANDS);
   'event_loop: loop {
@@ -275,7 +292,7 @@ fn event_loop (rx: Receiver<Message>, read_end: c_int) {
         if sql_futures.len() + 1 >= PIPELINE_LIM_COMMANDS {break}
         let pending = match pending_futures.pop_front() {Some (f) => f, None => break};
         if first {first = false} else {sql.push_str ("; ")}
-        sql.push_str ("BEGIN; ");
+        write! (&mut sql, "BEGIN; SELECT {} AS future_id; ", pending.0.id) .expect ("!write");
         for piece in pending.0.sql.iter() {
           match piece {
             &PgQueryPiece::Static (ref ss) => sql.push_str (ss),
@@ -310,7 +327,7 @@ fn event_loop (rx: Receiver<Message>, read_end: c_int) {
 
         loop {
           if unsafe {pq::PQisBusy (conn.conn)} == 1 {break}
-          let mut error;
+          let mut error = false;
           let mut after_future = false;
           if conn.in_flight_init {
             conn.in_flight_init = false;
@@ -321,30 +338,36 @@ fn event_loop (rx: Receiver<Message>, read_end: c_int) {
             let pg_future = match conn.in_flight.pop_front() {Some (f) => f, None => break};
             after_future = true;
 
-            // Every statement is wrapped in a "BEGIN; $statement; COMMIT" transaction and produces not one but three results.
+            // Every statement is wrapped in a "BEGIN; SELECT $id; $statement; COMMIT" transaction and produces not one but three results.
 
-            let begin_res = unsafe {pq::PQgetResult (conn.conn)};
-            if begin_res == null_mut() {panic! ("Got no BEGIN result for {:?}", pg_future)}
-            if error_in_result (begin_res) .is_some() {panic! ("Error in BEGIN")}
-            unsafe {pq::PQclear (begin_res)}
+            { let begin_res = unsafe {pq::PQgetResult (conn.conn)};
+              if begin_res == null_mut() {panic! ("Got no BEGIN result for {:?}", pg_future)}
+              if error_in_result (begin_res) .is_some() {panic! ("Error in BEGIN")}
+              unsafe {pq::PQclear (begin_res)} }
 
-            let statement_res = unsafe {pq::PQgetResult (conn.conn)};
-            if statement_res == null_mut() {panic! ("Got no statement result for {:?}", pg_future)}
-            error = error_in_result (statement_res) .is_some();
+            { // Check that we're getting results for the right future.
+              let id_res = unsafe {pq::PQgetResult (conn.conn)};
+              if id_res == null_mut() {panic! ("Got no ID result for {:?}", pg_future)}
+              if error_in_result (id_res) .is_some() {panic! ("Error in ID")}
+              assert_eq! (unsafe {pq::PQntuples (id_res)}, 1);
+              assert_eq! (unsafe {pq::PQnfields (id_res)}, 1);
+              let id = unsafe {CStr::from_ptr (pq::PQgetvalue (id_res, 0, 0))} .to_str() .expect ("!to_str");
+              let id: u64 = id.parse().expect ("!id");
+              assert_eq! (id, pg_future.0.id);  // The check.
+              unsafe {pq::PQclear (id_res)} }
+
+            let expect_results = pg_future.0.statements as usize + 1;
             let mut sync = pg_future.0.sync.lock().expect ("!lock");
-            sync.res = Some (PgResult {  // NB: `PgResult` takes responsibility to `PQclear` the `statement_res`.
-              res: statement_res,
-              rows: unsafe {pq::PQntuples (statement_res)} as u32,
-              columns: unsafe {pq::PQnfields (statement_res)} as u32});
-
-            if !error {
-              let commit_res = unsafe {pq::PQgetResult (conn.conn)};
-              if commit_res == null_mut() {panic! ("Got no COMMIT result for {:?}", pg_future)}
-              error = error_in_result (commit_res) .is_some();
-              if error {  // Share commit error with the client.
-                sync.res = Some (PgResult {res: commit_res, rows: 0, columns: 0})
-              } else {
-                unsafe {pq::PQclear (commit_res)}}}
+            sync.results.reserve_exact (expect_results);
+            for num in 0..expect_results {
+              let statement_res = unsafe {pq::PQgetResult (conn.conn)};
+              if statement_res == null_mut() {panic! ("Got no statement {} result for {:?}", num, pg_future)}
+              error = error_in_result (statement_res) .is_some();
+              sync.results.push (PgResult {  // NB: `PgResult` takes responsibility to `PQclear` the `statement_res`.
+                res: statement_res,
+                rows: unsafe {pq::PQntuples (statement_res)} as u32,
+                columns: unsafe {pq::PQnfields (statement_res)} as u32});
+              if error {break}}
 
             if let Some (ref task) = sync.task {task.unpark()}}
 
@@ -409,19 +432,27 @@ impl Cluster {
     try_s! (nix::unistd::write (self.write_end, &[1]));
     Ok(())}
 
-  /// Schedule the SQL to be executed on one of the nodes.
+  /// Schedule an SQL command to be executed on one of the nodes.
   ///
-  /// The client must ensure that no more than a single command is passed.
-  /// Passing multiple queries "SELECT 1; SELECT 2" is *not* allowed.
+  /// SQL will be run inside a transaction.
   ///
-  /// No transactions allowed.
-  /// (CTEs might be used as a workaround, cf.
-  ///  https://www.postgresql.org/docs/9.4/static/queries-with.html#QUERIES-WITH-MODIFYING,
-  ///  https://omniti.com/seeds/writable-ctes-improve-performance).
+  /// When using multiple statements, the library user must specify the exact number of top-level statements that the PostgreSQL server is going to see.
+  /// For example:
+  /// ```
+  ///   cluster.execute ((2, "SELECT 1; SELECT 2"));  // Running two statements as a single op.
+  ///   cluster.execute ((3, "DELETE FROM foo; INSERT INTO foo VALUES (1); INSERT INTO foo VALUES (2)"));  // Running three statements.
+  /// ```
+  ///
+  /// To avoid SQL injection one might use the escapes provided by `PgQueryPiece`:
+  /// ```
+  ///   use pg_async::PgQueryPiece::{Static as S, Literal as L};
+  ///   cluster.execute (vec! [S ("SELECT * FROM foo WHERE bar = "), L (bar)]);
+  /// ```
   pub fn execute<I: IntoQueryPieces> (&self, sql: I) -> Result<PgFuture, String> {
     self.command_num.compare_and_swap (u64::max_value(), 0, Ordering::Relaxed);  // Recycle the set of identifiers.
     let id = self.command_num.fetch_add (1, Ordering::Relaxed) + 1;
-    let pg_future = PgFuture::new (id, sql.into_query_pieces());
+    let (statements, pieces) = sql.into_query_pieces();
+    let pg_future = PgFuture::new (id, statements, pieces);
 
     try_s! (self.tx.send (Message::Execute (pg_future.clone())));
     try_s! (nix::unistd::write (self.write_end, &[2]));

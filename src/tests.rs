@@ -18,7 +18,7 @@ lazy_static! {
     results.push ((3, cluster.execute ("SELECT 3") .expect ("!select 3")));}
 
   for (expect, pr) in results {
-    let pr: PgResult = pr.wait().expect ("!pr");
+    let pr: PgResult = pr.wait().expect ("!pr") .remove (0);
     assert_eq! (expect, pr.row (0) .col_str (0) .unwrap().parse().unwrap());}}
 
 #[test] fn error() {  // Errors should be returned and should not affect the rest of pipelined statements.
@@ -36,7 +36,7 @@ lazy_static! {
   for (op, i) in ops.into_iter().zip (0..) {
     let rc = op.wait();
     if i % 10 != 0 {
-      let pr = rc.expect ("!op");
+      let pr: PgResult = rc.expect ("!op") .remove (0);
       assert_eq! (i, pr.row (0) .col_str (0) .unwrap().parse().unwrap() :u32);
     } else {
       assert! (rc.is_err());}}}  // Expected error.
@@ -60,7 +60,7 @@ lazy_static! {
   for op in ops {let _ = op.wait();}
   std::thread::sleep (std::time::Duration::from_secs (1));  // Give BDR a bit of time to synchronize the INSERTs.
 
-  let rows = cluster.execute ("SELECT t FROM pg_async_durability_test ORDER BY t") .unwrap().wait().unwrap();
+  let rows = cluster.execute ("SELECT t FROM pg_async_durability_test ORDER BY t") .unwrap().wait().unwrap().remove (0);
   let mut rows = rows.iter();
   for i in 0..100 {
     if i % 10 != 0 {
@@ -68,3 +68,21 @@ lazy_static! {
       assert_eq! (format! ("{:02}", i), row.col_str (0) .unwrap());}}
 
   let _ = cluster.execute ("DROP TABLE pg_async_durability_test") .unwrap().wait();}
+
+#[test] fn transactions() {
+  let sql = "\
+    CREATE TEMPORARY TABLE pg_async_transactions_test (i INTEGER) ON COMMIT DROP; \
+    INSERT INTO pg_async_transactions_test (i) VALUES (1); \
+    SAVEPOINT tx1; \
+    INSERT INTO pg_async_transactions_test (i) VALUES (2); \
+    ROLLBACK TO SAVEPOINT tx1; \
+    INSERT INTO pg_async_transactions_test (i) VALUES (3); \
+    SELECT SUM (i) FROM pg_async_transactions_test";
+
+  let cluster = Cluster::new() .expect ("!Cluster");
+  for dsn in DSNS.iter() {cluster.connect (dsn.clone(), 1) .expect ("!connect")}
+  let mut ops = Vec::new();
+  for _ in 0..9 {ops.push (cluster.execute ((7, sql)) .unwrap())}
+  for op in ops {
+    let rows = op.wait().unwrap().remove (6);  // SELECT is the 6th statement.
+    assert_eq! (rows.row (0) .col (0), b"4");}}
