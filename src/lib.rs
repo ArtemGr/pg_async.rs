@@ -20,13 +20,15 @@ use nix::poll::{self, EventFlags, PollFd};
 use nix::fcntl::{O_NONBLOCK, O_CLOEXEC};
 //use serde_json::{Value as Json};
 use std::collections::VecDeque;
+use std::convert::From;
 use std::error::Error;
 use std::ffi::{CString, CStr};
 use std::fmt;
 use std::io;
 use std::ptr::null_mut;
 use std::slice::from_raw_parts;
-use std::sync::{Arc, Mutex};
+use std::str::Utf8Error;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Sender, Receiver, TryRecvError};
 use std::thread::JoinHandle;
@@ -150,8 +152,8 @@ struct PgFutureImpl {
   sql: Vec<PgQueryPiece>,
   sync: Mutex<PgFutureSync>}
 
-/// Returned when an SQL operation fails. Prints the SQL in `Debug`.
-pub struct PgFutureErr {
+/// The part of `PgFutureErr` that's used when the SQL fails.
+pub struct PgSqlErr {
   /// Pointer to the failed future, which we keep in order to print the SQL in `Debug`.
   imp: Arc<PgFutureImpl>,
   /// Which statement has failed.
@@ -160,18 +162,42 @@ pub struct PgFutureErr {
   pub num: u32,
   /// Returned by `PQresStatus`, "string constant describing the status code".
   pub status: &'static str,
-  pub message: String}
+  pub message: String  }
+
+/// Returned when the future fails. Might print the SQL in `Debug`.
+pub enum PgFutureErr {
+  PoisonError,
+  Utf8Error (Utf8Error),
+  Sql (PgSqlErr)}
 
 impl fmt::Debug for PgFutureErr {
   fn fmt (&self, ft: &mut fmt::Formatter) -> Result<(), fmt::Error> {
-    write! (ft, "PgFutureErr ({:?}, {})", self.imp.sql, self.message)}}
+    match self {
+      &PgFutureErr::PoisonError => ft.write_str ("PgFutureErr::PoisonError"),
+      &PgFutureErr::Utf8Error (_) => ft.write_str ("PgFutureErr::Utf8Error"),
+      &PgFutureErr::Sql (ref se) => write! (ft, "PgFutureErr ({:?}, {})", se.imp.sql, se.message)}}}
 
 impl fmt::Display for PgFutureErr {
   fn fmt (&self, ft: &mut fmt::Formatter) -> Result<(), fmt::Error> {
-    ft.write_str (&self.message)}}
+    match self {
+      &PgFutureErr::PoisonError => ft.write_str ("PgFutureErr::PoisonError"),
+      &PgFutureErr::Utf8Error (_) => ft.write_str ("PgFutureErr::Utf8Error"),
+      &PgFutureErr::Sql (ref se) => ft.write_str (&se.message)}}}
 
 impl Error for PgFutureErr {
-  fn description (&self) -> &str {&self.message[..]}}
+  fn description (&self) -> &str {
+    match self {
+      &PgFutureErr::PoisonError => "PgFutureErr::PoisonError",
+      &PgFutureErr::Utf8Error (_) => "PgFutureErr::Utf8Error",
+      &PgFutureErr::Sql (ref se) => &se.message[..]}}}
+
+impl<T> From<PoisonError<T>> for PgFutureErr {
+  fn from (_err: PoisonError<T>) -> PgFutureErr {
+    PgFutureErr::PoisonError}}
+
+impl From<Utf8Error> for PgFutureErr {
+  fn from (err: Utf8Error) -> PgFutureErr {
+    PgFutureErr::Utf8Error (err)}}
 
 /// Delayed SQL result.
 #[derive(Clone)]
@@ -193,9 +219,9 @@ impl fmt::Debug for PgFuture {
 
 impl Future for PgFuture {
   type Item = Vec<PgResult>;
-  type Error = Box<Error>;
-  fn poll (&mut self) -> Poll<Vec<PgResult>, Box<Error>> {
-    let mut sync = try_f! (self.0.sync.lock());
+  type Error = PgFutureErr;
+  fn poll (&mut self) -> Poll<Vec<PgResult>, PgFutureErr> {
+    let mut sync = self.0.sync.lock()?;
 
     if sync.results.is_empty() {
       sync.task = Some (park());
@@ -203,9 +229,9 @@ impl Future for PgFuture {
 
     for (pr, num) in sync.results.iter().zip (0..) {
       if let Some (status) = error_in_result (pr.res) {
-        let status = try_f! (unsafe {CStr::from_ptr (pq::PQresStatus (status))} .to_str());
-        let err = try_f! (unsafe {CStr::from_ptr (pq::PQresultErrorMessage (pr.res))} .to_str());
-        return Err (Box::new (PgFutureErr {
+        let status = unsafe {CStr::from_ptr (pq::PQresStatus (status))} .to_str()?;
+        let err = unsafe {CStr::from_ptr (pq::PQresultErrorMessage (pr.res))} .to_str()?;
+        return Err (PgFutureErr::Sql (PgSqlErr {
           imp: self.0.clone(),
           num: num,
           status: status,
@@ -428,7 +454,7 @@ pub struct Cluster {
   /// Runs the event loop.
   thread: Option<JoinHandle<()>>,
   /// Channel to the `thread`.
-  tx: Sender<Message>,
+  tx: Mutex<Sender<Message>>,
   /// pipe2 file descriptor used to wake the poll thread.
   write_end: c_int,
   /// Used to generate the unique identifiers for the asynchronous SQL commands.
@@ -442,7 +468,7 @@ impl Cluster {
     let thread = try_s! (std::thread::Builder::new().name ("pg_async".into()) .spawn (move || event_loop (rx, read_end)));
     Ok (Cluster {
       thread: Some (thread),
-      tx: tx,
+      tx: Mutex::new (tx),
       write_end: write_end,
       command_num: AtomicU64::new (0)})}
 
@@ -456,7 +482,7 @@ impl Cluster {
   /// * `mul` - Pipelining support in `libpq` is currently limited to one batch of queries per connection,
   ///           but parallelism can be increased by adding the same connection several times.
   pub fn connect (&self, dsn: String, mul: u8) -> Result<(), String> {
-    try_s! (self.tx.send (Message::Connect (dsn, mul)));
+    try_s! (try_s! (self.tx.lock()) .send (Message::Connect (dsn, mul)));
     try_s! (nix::unistd::write (self.write_end, &[1]));
     Ok(())}
 
@@ -482,13 +508,14 @@ impl Cluster {
     let (statements, pieces) = sql.into_query_pieces();
     let pg_future = PgFuture::new (id, statements, pieces);
 
-    try_s! (self.tx.send (Message::Execute (pg_future.clone())));
+    try_s! (try_s! (self.tx.lock()) .send (Message::Execute (pg_future.clone())));
     try_s! (nix::unistd::write (self.write_end, &[2]));
     Ok (pg_future)}}
 
 impl Drop for Cluster {
   fn drop (&mut self) {
-    let _ = self.tx.send (Message::Drop);
+    if let Ok (tx) = self.tx.lock() {
+      let _ = tx.send (Message::Drop);}
     let _ = nix::unistd::write (self.write_end, &[3]);
     let mut thread = None;
     std::mem::swap (&mut thread, &mut self.thread);

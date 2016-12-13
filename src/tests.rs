@@ -21,12 +21,17 @@ lazy_static! {
     let pr: PgResult = pr.wait().expect ("!pr") .remove (0);
     assert_eq! (expect, pr.row (0) .col_str (0) .unwrap().parse().unwrap());}}
 
+fn check_send<T: Send>(_: &T) {}
+fn check_sync<T: Sync>(_: &T) {}
+
 #[test] fn error() {  // Errors should be returned and should not affect the rest of pipelined statements.
   let cluster = Cluster::new() .expect ("!Cluster");
+  check_send (&cluster); check_sync (&cluster);
   for dsn in DSNS.iter() {cluster.connect (dsn.clone(), 1) .expect ("!connect")}
   let f = cluster.execute ("SELECT abrakadabra") .expect ("!execute");
+  check_send (&f); check_sync (&f);
   match f.wait() {
-    Err (ref err) if err.description().contains ("PGRES_FATAL_ERROR") => (),  // Expected error.
+    Err (ref err) if err.description().contains ("PGRES_FATAL_ERROR") => {check_send (err); check_sync (err)},  // Expected error.
     x => panic! ("Unexpected result (no error?): {:?}", x)}
 
   // Check how the presence of errors affects the pipeline.
