@@ -18,7 +18,7 @@ doctest = false
 
 [dependencies]
 futures = "0.1"
-gstuff = "0.1.5"
+gstuff = "0.2"
 itertools = "0.5"
 lazy_static = "0.2"
 libc = "0.2"
