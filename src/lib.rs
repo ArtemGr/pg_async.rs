@@ -390,16 +390,33 @@ fn event_loop (rx: Receiver<Message>, read_end: c_int) {
             error = error_in_result (res) .is_some()
           } else {
             let pg_future = match conn.in_flight.pop_front() {Some (f) => f, None => break};
+            let mut sync = pg_future.0.sync.lock().expect ("!lock");
             after_future = true;
 
             // Every statement is wrapped in a "BEGIN; SELECT $id; $statement; COMMIT" transaction and produces not one but three results.
 
             { let begin_res = unsafe {pq::PQgetResult (conn.conn)};
               if begin_res == null_mut() {panic! ("Got no BEGIN result for {:?}", pg_future)}
-              if error_in_result (begin_res) .is_some() {panic! ("Error in BEGIN")}
+              if let Some (error_status) = error_in_result (begin_res) {
+                // BEGIN fails when there is a syntax error in the pipeline SQL.
+                // The error might be in a statement that exists later in the pipeline and is not related to `pg_future`,
+                // but to properly match the error to the right `pg_future` we'd have to parse the error message for the exact location of the error
+                // (e.g. 62 in 'syntax error at or near "group" at character 62') and trace it back to `pg_future` by knowing which part
+                // of the pipeline SQL belongs to it.
+                // Hopefully the libpq pipelining patch from 2ndquadrant will make it simpler.
+
+                // We can do a shortcut and just fail the query that happens to be at the head of the pipeline, like this:
+                //sync.results.push (PgResult {  // NB: `PgResult` takes responsibility to `PQclear` the `statement_res`.
+                //  res: begin_res, rows: 0, columns: 0});
+                //error = true;
+
+                // But for now it might be better if we just panic. SQL is code and syntax errors aren't usually expected.
+                let status = unsafe {CStr::from_ptr (pq::PQresStatus (error_status))} .to_str() .expect ("!to_str");
+                let err = unsafe {CStr::from_ptr (pq::PQresultErrorMessage (begin_res))} .to_str() .expect ("!to_str");
+                panic! ("BEGIN failed. Probably a syntax error in one of the pipelined SQL statements. {},\n{}", status, err);}
               unsafe {pq::PQclear (begin_res)} }
 
-            { // Check that we're getting results for the right future.
+            if !error { // Check that we're getting results for the right future.
               let id_res = unsafe {pq::PQgetResult (conn.conn)};
               if id_res == null_mut() {panic! ("Got no ID result for {:?}", pg_future)}
               if error_in_result (id_res) .is_some() {panic! ("Error in ID")}
@@ -411,17 +428,16 @@ fn event_loop (rx: Receiver<Message>, read_end: c_int) {
               unsafe {pq::PQclear (id_res)} }
 
             let expect_results = pg_future.0.statements as usize + 1;
-            let mut sync = pg_future.0.sync.lock().expect ("!lock");
             sync.results.reserve_exact (expect_results);
             for num in 0..expect_results {
+              if error {break}
               let statement_res = unsafe {pq::PQgetResult (conn.conn)};
               if statement_res == null_mut() {panic! ("Got no statement {} result for {:?}", num, pg_future)}
               error = error_in_result (statement_res) .is_some();
               sync.results.push (PgResult {  // NB: `PgResult` takes responsibility to `PQclear` the `statement_res`.
                 res: statement_res,
                 rows: unsafe {pq::PQntuples (statement_res)} as u32,
-                columns: unsafe {pq::PQnfields (statement_res)} as u32});
-              if error {break}}
+                columns: unsafe {pq::PQnfields (statement_res)} as u32});}
 
             if let Some (ref task) = sync.task {task.unpark()}}
 
