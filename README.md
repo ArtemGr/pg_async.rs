@@ -2,6 +2,7 @@
 Asynchronous, HA (master-master) PostgreSQL driver on top of libpq.
 
 [![crate](https://img.shields.io/crates/v/pg_async.svg)](https://crates.io/crates/pg_async)
+[![docs](https://docs.rs/pg_async/badge.svg)](https://docs.rs/pg_async/)
 ![](https://tokei.rs/b1/github/ArtemGr/pg_async.rs)
 
 ## Vision
