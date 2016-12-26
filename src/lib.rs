@@ -508,12 +508,14 @@ impl Cluster {
   ///
   /// When using multiple statements, the library user must specify the exact number of top-level statements that the PostgreSQL server is going to see.
   /// For example:
+  ///
   /// ```
   ///   cluster.execute ((2, "SELECT 1; SELECT 2"));  // Running two statements as a single op.
   ///   cluster.execute ((3, "DELETE FROM foo; INSERT INTO foo VALUES (1); INSERT INTO foo VALUES (2)"));  // Running three statements.
   /// ```
   ///
   /// To avoid SQL injection one might use the escapes provided by `PgQueryPiece`:
+  ///
   /// ```
   ///   use pg_async::PgQueryPiece::{Static as S, Literal as L};
   ///   cluster.execute (vec! [S ("SELECT * FROM foo WHERE bar = "), L (bar)]);
