@@ -1,6 +1,9 @@
 ## pg_async.rs
 Asynchronous, HA (master-master) PostgreSQL driver on top of libpq.
 
+[![crate](https://img.shields.io/crates/v/pg_async.svg)](https://crates.io/crates/pg_async)
+![](https://tokei.rs/b1/github/ArtemGr/pg_async.rs)
+
 ## Vision
 - [x] Works with a master-master replicated database, such as BDR.
 - [x] Uses `libpq`, leveraging it's asynchronous support.

@@ -5,9 +5,9 @@ authors = ["Artem <artemciy@gmail.com>"]
 links = "pq"
 build = "build.rs"
 description = "Asynchronous, HA (master-master) PostgreSQL driver on top of libpq"
-#documentation = "..."
+#documentation = "https://docs.rs/pg_async/"
 repository = "https://github.com/ArtemGr/pg_async.rs"
-keywords = ["futures", "high availability"]
+keywords = ["futures", "high-availability"]
 license = "MIT"
 
 [lib]
