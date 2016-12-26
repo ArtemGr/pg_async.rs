@@ -5,7 +5,7 @@ Asynchronous, HA (master-master) PostgreSQL driver on top of libpq.
 ![](https://tokei.rs/b1/github/ArtemGr/pg_async.rs)
 
 ## Vision
-- [x] Works with a master-master replicated database, such as BDR.
+- [x] Designed to work with a master-master replicated database, such as BDR (but standalone databases are supported as well).
 - [x] Uses `libpq`, leveraging it's asynchronous support.
 - [x] Maintains an asynchronous connection to every node of the replicated cluster.
 - [ ] Pings the nodes (with `SELECT 1`) to see who's closer/faster.
