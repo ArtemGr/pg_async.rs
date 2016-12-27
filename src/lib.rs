@@ -106,7 +106,7 @@ unsafe impl Sync for PgResult {}
 unsafe impl Send for PgResult {}
 
 impl PgResult {
-  /// True if there is no rows in the result.
+  /// True if there are no rows in the result.
   pub fn is_empty (&self) -> bool {self.rows == 0}
   /// Number of rows.
   pub fn len (&self) -> u32 {self.rows}
@@ -262,9 +262,6 @@ impl Connection {
 fn error_in_result (res: *const pq::PGresult) -> Option<pq::ExecStatusType> {
   let status = unsafe {pq::PQresultStatus (res)};
   if status != pq::PGRES_COMMAND_OK && status != pq::PGRES_TUPLES_OK {Some (status)} else {None}}
-
-// TODO: Fetch the entire pipeline results first and unpark the futures second.
-// That way we could notify the DML futures that the pipeline has failed and the modifications weren't committed.
 
 // Limit the size of the pipeline. This is especially important in the presence of errors,
 // because we have to reschedule the majority of the commands after an error.
