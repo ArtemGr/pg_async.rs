@@ -16,5 +16,5 @@ Asynchronous, HA (master-master) PostgreSQL driver on top of libpq.
 - [x] `futures` are backed by a thread or two and can be used without a `tokio` reactor (because KISS).
 - [ ] Fast mode: send the operation to every node and return the first answer.
 - [ ] Pin mode: send the operation to one of the nodes only (useful to avoid some of the master-master conflicts).
-- [ ] There is a JSON helper converting table rows to serde_json objects.
+- [x] There is a JSON helper converting table rows to serde_json objects.
 - [ ] If the operation wasn't pipelined already, dropping a `Future` allows the driver to cancel it.

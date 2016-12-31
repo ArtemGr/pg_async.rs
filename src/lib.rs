@@ -18,8 +18,8 @@ use futures::task::{park, Task};
 use libc::{c_char, c_int, c_void};
 use nix::poll::{self, EventFlags, PollFd};
 use nix::fcntl::{O_NONBLOCK, O_CLOEXEC};
-//use serde_json::{Value as Json};
-use std::collections::VecDeque;
+use serde_json::{Value as Json};
+use std::collections::{BTreeMap, VecDeque};
 use std::convert::From;
 use std::error::Error;
 use std::ffi::{CString, CStr};
@@ -27,7 +27,7 @@ use std::fmt;
 use std::io;
 use std::ptr::null_mut;
 use std::slice::from_raw_parts;
-use std::str::Utf8Error;
+use std::str::{from_utf8, Utf8Error};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Sender, Receiver, TryRecvError};
@@ -81,16 +81,29 @@ impl<'a> PgRow<'a> {
   pub fn is_null (&self, column: u32) -> bool {
     if column > self.0.columns {panic! ("Column index {} is out of range (0..{})", column, self.0.columns)}
     1 == unsafe {pq::PQgetisnull ((self.0).res, self.1 as c_int, column as c_int)}}
+
   /// PostgreSQL internal OID number of the column type.
   pub fn ftype (&self, column: u32) -> pq::Oid {
     if column > self.0.columns {panic! ("Column index {} is out of range (0..{})", column, self.0.columns)}
     unsafe {pq::PQftype ((self.0).res, column as c_int)}}
+
+  /// Returns the column name associated with the given column number. Column numbers start at 0.
+  pub fn fname (&'a self, column: u32) -> Result<&'a str, Utf8Error> {
+    self.0.fname (column)}
+
+  /// Return this row's number withing the result.
+  pub fn num (&self) -> u32 {self.1}
+
+  /// Returns the number of columns in the row. Row numbers start at 0.
+  pub fn len (&self) -> u32 {self.0.columns}
+
   /// Returns an empty array if the value is NULL.
   pub fn col (&self, column: u32) -> &'a [u8] {
     if column > self.0.columns {panic! ("Column index {} is out of range (0..{})", column, self.0.columns)}
     let len = unsafe {pq::PQgetlength ((self.0).res, self.1 as c_int, column as c_int)};
     let val = unsafe {pq::PQgetvalue ((self.0).res, self.1 as c_int, column as c_int)};
     unsafe {from_raw_parts (val as *const u8, len as usize)}}
+
   /// Returns an empty string if the value is NULL.
   pub fn col_str (&self, column: u32) -> Result<&'a str, std::str::Utf8Error> {
     if column > self.0.columns {panic! ("Column index {} is out of range (0..{})", column, self.0.columns)}
@@ -108,18 +121,55 @@ unsafe impl Send for PgResult {}
 impl PgResult {
   /// True if there are no rows in the result.
   pub fn is_empty (&self) -> bool {self.rows == 0}
+
   /// Number of rows.
   pub fn len (&self) -> u32 {self.rows}
+
   /// PostgreSQL internal OID number of the column type.
   pub fn ftype (&self, column: u32) -> pq::Oid {
     if column > self.columns {panic! ("Column index {} is out of range (0..{})", column, self.columns)}
     unsafe {pq::PQftype (self.res, column as c_int)}}
+
+  /// Returns the column name associated with the given column number. Column numbers start at 0.
+  pub fn fname<'a> (&'a self, column: u32) -> Result<&'a str, Utf8Error> {
+    let name = unsafe {pq::PQfname (self.res, column as c_int)};
+    if name == null_mut() {panic! ("Column index {} is out of range (0..{})", column, self.columns)}
+    unsafe {CStr::from_ptr (name)} .to_str()}
+
   pub fn row (&self, row: u32) -> PgRow {
     if row >= self.rows {panic! ("Row index {} is out of range (0..{})", row, self.rows)}
     PgRow (self, row)}
+
   /// Iterator over result rows.
   pub fn iter<'a> (&'a self) -> PgResultIt<'a> {
-    PgResultIt {pr: self, row: 0}}}
+    PgResultIt {pr: self, row: 0}}
+
+  /// Convers a PostgreSQL query result into a JSON array of rows, [{$name: $value, ...}, ...].
+  pub fn to_json (&self) -> Result<Json, PgFutureErr> {
+    let mut jrows: Vec<Json> = Vec::with_capacity (self.len() as usize);
+    for row in self.iter() {
+      let mut jrow: BTreeMap<String, Json> = BTreeMap::new();
+      for column in 0 .. self.columns {
+        let name = self.fname (column)?;
+        let jval = if row.is_null (column) {
+          Json::Null
+        } else {
+          match self.ftype (column) {
+            20 | 21 | 23 => Json::I64 (row.col_str (column) ?. parse() ?),  // 20 - bigint, 21 - smallint, 23 - integer
+            25 | 1042 | 1043 => Json::String (from_utf8 (row.col (column)) ?.into()),  // 25 - text, 1042 - char, 1043 - varchar
+            700 | 701 => Json::F64 (row.col_str (column) ?. parse() ?),  // 700 - real, 701 - double precision
+            // TODO (types I use):
+            // 16 => Type::Bool,
+            // 114 => Type::Json,
+            // 1184 => Type::TimestampTZ,
+            // 1700 => Type::Numeric,
+            // 3614 => Type::Tsvector,
+            // 3802 => Type::Jsonb,
+            // 3926 => Type::Int8Range
+            oid => return Err (PgFutureErr::UnknownType (String::from (name), oid))}};
+        jrow.insert (String::from (name), jval);}
+      jrows.push (Json::Object (jrow))}
+    Ok (Json::Array (jrows))}}
 
 impl Drop for PgResult {
   fn drop (&mut self) {
@@ -168,28 +218,45 @@ pub struct PgSqlErr {
 pub enum PgFutureErr {
   PoisonError,
   Utf8Error (Utf8Error),
-  Sql (PgSqlErr)}
+  Sql (PgSqlErr),
+  Json (serde_json::Error),
+  Int (std::num::ParseIntError),
+  Float (std::num::ParseFloatError),
+  /// Happens when we don't know how to convert a value to JSON.
+  UnknownType (String, pq::Oid)}
 
 impl fmt::Debug for PgFutureErr {
   fn fmt (&self, ft: &mut fmt::Formatter) -> Result<(), fmt::Error> {
     match self {
       &PgFutureErr::PoisonError => ft.write_str ("PgFutureErr::PoisonError"),
-      &PgFutureErr::Utf8Error (_) => ft.write_str ("PgFutureErr::Utf8Error"),
-      &PgFutureErr::Sql (ref se) => write! (ft, "PgFutureErr ({:?}, {})", se.imp.sql, se.message)}}}
+      &PgFutureErr::Utf8Error (ref err) => write! (ft, "PgFutureErr::Utf8Error ({:?})", err),
+      &PgFutureErr::Sql (ref se) => write! (ft, "PgFutureErr ({:?}, {})", se.imp.sql, se.message),
+      &PgFutureErr::Json (ref err) => write! (ft, "PgFutureErr::Json ({:?})", err),
+      &PgFutureErr::Int (ref err) => write! (ft, "PgFutureErr::Int ({:?})", err),
+      &PgFutureErr::Float (ref err) => write! (ft, "PgFutureErr::Float ({:?})", err),
+      &PgFutureErr::UnknownType (ref fname, oid) => write! (ft, "PgFutureErr::UnknownType (fname '{}', oid {})", fname, oid)}}}
 
 impl fmt::Display for PgFutureErr {
   fn fmt (&self, ft: &mut fmt::Formatter) -> Result<(), fmt::Error> {
     match self {
       &PgFutureErr::PoisonError => ft.write_str ("PgFutureErr::PoisonError"),
-      &PgFutureErr::Utf8Error (_) => ft.write_str ("PgFutureErr::Utf8Error"),
-      &PgFutureErr::Sql (ref se) => ft.write_str (&se.message)}}}
+      &PgFutureErr::Utf8Error (ref err) => write! (ft, "PgFutureErr::Utf8Error ({})", err),
+      &PgFutureErr::Sql (ref se) => ft.write_str (&se.message),
+      &PgFutureErr::Json (ref err) => write! (ft, "PgFutureErr::Json ({})", err),
+      &PgFutureErr::Int (ref err) => write! (ft, "PgFutureErr::Int ({})", err),
+      &PgFutureErr::Float (ref err) => write! (ft, "PgFutureErr::Float ({})", err),
+      &PgFutureErr::UnknownType (ref fname, oid) => write! (ft, "Column '{}' has unfamiliar OID {}", fname, oid)}}}
 
 impl Error for PgFutureErr {
   fn description (&self) -> &str {
     match self {
       &PgFutureErr::PoisonError => "PgFutureErr::PoisonError",
       &PgFutureErr::Utf8Error (_) => "PgFutureErr::Utf8Error",
-      &PgFutureErr::Sql (ref se) => &se.message[..]}}}
+      &PgFutureErr::Sql (ref se) => &se.message[..],
+      &PgFutureErr::Json (_) => "PgFutureErr::Json",
+      &PgFutureErr::Int (_) => "PgFutureErr::Int",
+      &PgFutureErr::Float (_) => "PgFutureErr::Float",
+      &PgFutureErr::UnknownType (..) => "PgFutureErr::UnknownType"}}}
 
 impl<T> From<PoisonError<T>> for PgFutureErr {
   fn from (_err: PoisonError<T>) -> PgFutureErr {
@@ -198,6 +265,18 @@ impl<T> From<PoisonError<T>> for PgFutureErr {
 impl From<Utf8Error> for PgFutureErr {
   fn from (err: Utf8Error) -> PgFutureErr {
     PgFutureErr::Utf8Error (err)}}
+
+impl From<serde_json::Error> for PgFutureErr {
+  fn from (err: serde_json::Error) -> PgFutureErr {
+    PgFutureErr::Json (err)}}
+
+impl From<std::num::ParseIntError> for PgFutureErr {
+  fn from (err: std::num::ParseIntError) -> PgFutureErr {
+    PgFutureErr::Int (err)}}
+
+impl From<std::num::ParseFloatError> for PgFutureErr {
+  fn from (err: std::num::ParseFloatError) -> PgFutureErr {
+    PgFutureErr::Float (err)}}
 
 /// Delayed SQL result.
 #[derive(Clone)]
