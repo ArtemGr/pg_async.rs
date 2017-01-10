@@ -27,7 +27,7 @@ use std::fmt;
 use std::io;
 use std::ptr::null_mut;
 use std::slice::from_raw_parts;
-use std::str::{from_utf8, Utf8Error};
+use std::str::{from_utf8_unchecked, from_utf8, Utf8Error};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Sender, Receiver, TryRecvError};
@@ -109,6 +109,12 @@ impl<'a> PgRow<'a> {
     if column > self.0.columns {panic! ("Column index {} is out of range (0..{})", column, self.0.columns)}
     unsafe {CStr::from_ptr (pq::PQgetvalue ((self.0).res, self.1 as c_int, column as c_int))} .to_str()}}
 
+fn is_alphabetic (ch:u8) -> bool {
+  (ch >= 0x41 && ch <= 0x5A) || (ch >= 0x61 && ch <= 0x7A)}
+
+fn is_digit (ch: u8) -> bool {
+  ch >= 0x30 && ch <= 0x39}
+
 pub struct PgResult {
   pub res: *mut pq::PGresult,
   pub rows: u32,
@@ -166,6 +172,16 @@ impl PgResult {
             // 3614 => Type::Tsvector,
             // 3802 => Type::Jsonb,
             // 3926 => Type::Int8Range
+            oid if oid > 16000 => {
+              // OID that large belong to user-defined types.
+              // We support enums by stringifying all user types in case they are ASCII.
+              // (I wonder if we could use `#define ANYENUMOID 3500` somehow to better detect if the OID is enum).
+              let bytes = row.col (column);
+              if bytes.is_empty() {return Err (PgFutureErr::UnknownType (String::from (name), oid))}
+              for &ch in bytes.iter() {
+                if !is_alphabetic (ch) && !is_digit (ch) && ch != b'_' && ch != b'-' && ch != b'.' {
+                  return Err (PgFutureErr::UnknownType (String::from (name), oid))}}
+              Json::String (unsafe {from_utf8_unchecked (bytes)} .into())},
             oid => return Err (PgFutureErr::UnknownType (String::from (name), oid))}};
         jrow.insert (String::from (name), jval);}
       jrows.push (Json::Object (jrow))}
