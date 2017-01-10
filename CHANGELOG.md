@@ -3,6 +3,10 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](http://keepachangelog.com/) and this project adheres to [Semantic Versioning](http://semver.org/).
 
+## [unreleased]
+###
+- Patreon badge. In case you want to thank me or help me stay afloat and develop this driver.
+
 ## [0.3.1] - 2016-12-31
 ### Added
 - Print the error details when the pipeline SQL fails.
