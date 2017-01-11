@@ -228,7 +228,11 @@ pub struct PgSqlErr {
   pub num: u32,
   /// Returned by `PQresStatus`, "string constant describing the status code".
   pub status: &'static str,
-  pub message: String  }
+  /// The SQLSTATE code identifies the type of error that has occurred;
+  /// it can be used by front-end applications to perform specific operations (such as error handling) in response to a particular database error.
+  /// cf. https://www.postgresql.org/docs/9.4/static/errcodes-appendix.html
+  pub sqlstate: String,
+  pub message: String}
 
 /// Returned when the future fails. Might print the SQL in `Debug`.
 pub enum PgFutureErr {
@@ -246,7 +250,7 @@ impl fmt::Debug for PgFutureErr {
     match self {
       &PgFutureErr::PoisonError => ft.write_str ("PgFutureErr::PoisonError"),
       &PgFutureErr::Utf8Error (ref err) => write! (ft, "PgFutureErr::Utf8Error ({:?})", err),
-      &PgFutureErr::Sql (ref se) => write! (ft, "PgFutureErr ({:?}, {})", se.imp.sql, se.message),
+      &PgFutureErr::Sql (ref se) => write! (ft, "PgFutureErr ({:?}, {}, {})", se.imp.sql, se.sqlstate, se.message),
       &PgFutureErr::Json (ref err) => write! (ft, "PgFutureErr::Json ({:?})", err),
       &PgFutureErr::Int (ref err) => write! (ft, "PgFutureErr::Int ({:?})", err),
       &PgFutureErr::Float (ref err) => write! (ft, "PgFutureErr::Float ({:?})", err),
@@ -325,11 +329,13 @@ impl Future for PgFuture {
     for (pr, num) in sync.results.iter().zip (0..) {
       if let Some (status) = error_in_result (pr.res) {
         let status = unsafe {CStr::from_ptr (pq::PQresStatus (status))} .to_str()?;
+        let sqlstate = unsafe {CStr::from_ptr (pq::PQresultErrorField (pr.res, pq::PG_DIAG_SQLSTATE))} .to_str()?;
         let err = unsafe {CStr::from_ptr (pq::PQresultErrorMessage (pr.res))} .to_str()?;
         return Err (PgFutureErr::Sql (PgSqlErr {
           imp: self.0.clone(),
           num: num,
           status: status,
+          sqlstate: sqlstate.into(),
           message: format! ("Error in statement {}: {}; {}", num, status, err)}))}}
 
     let mut res = Vec::with_capacity (sync.results.len());
@@ -345,8 +351,12 @@ enum Message {
 
 #[derive(Debug)]
 struct Connection {
-  conn: *mut pq::PGconn,
+  /// Keep connection string, allowing us to reconnect when connection fails.
+  dsn: String,
+  handle: *mut pq::PGconn,
   in_flight: VecDeque<PgFuture>,
+  /// True if we're waiting for the server connection to happen.
+  pending: bool,
   /// True if there is an internal statement in flight.
   in_flight_init: bool}
 
@@ -370,8 +380,7 @@ fn event_loop (rx: Receiver<Message>, read_end: c_int) {
   // (If you need to run concurrent commands, use multiple connections.)"
   use std::fmt::Write;
 
-  let mut pending_connections: Vec<*mut pq::PGconn> = Vec::new();
-  let mut good_connections: Vec<Connection> = Vec::new();
+  let mut connections: Vec<Connection> = Vec::new();
   let mut fds = Vec::new();
   let mut pending_futures: VecDeque<PgFuture> = VecDeque::new();
   let mut sql = String::with_capacity (PIPELINE_LIM_BYTES + 1024);
@@ -383,26 +392,30 @@ fn event_loop (rx: Receiver<Message>, read_end: c_int) {
       Err (TryRecvError::Empty) => break,
       Ok (message) => match message {
         Message::Connect (dsn, mul) => {
-          // TODO: Keep a copy of `dsn` and `mul` in case we'll need to recreate a failed connection.
-          let dsn = CString::new (dsn) .expect ("!dsn");
+          let dsn_c = CString::new (&dsn[..]) .expect ("!dsn");
           for _ in 0 .. mul {
-            let conn = unsafe {pq::PQconnectStart (dsn.as_ptr())};
+            let conn = unsafe {pq::PQconnectStart (dsn_c.as_ptr())};
             if conn == null_mut() {panic! ("!PQconnectStart")}
-            pending_connections.push (conn);}},
+            connections.push (Connection {
+              dsn: dsn.clone(),
+              handle: conn,
+              in_flight: VecDeque::new(),
+              pending: true,
+              in_flight_init: false});}},
         Message::Execute (pg_future) => pending_futures.push_back (pg_future),
         Message::Drop => break 'event_loop}}}  // Cluster is dropping.
 
     fds.clear();
 
-    for idx in (0 .. pending_connections.len()) .rev() {
-      let conn: *mut pq::PGconn = pending_connections[idx];
-      let status = unsafe {pq::PQstatus (conn)};
+    for conn in connections.iter_mut().filter (|conn| conn.pending) {
+      let status = unsafe {pq::PQstatus (conn.handle)};
       if status == pq::CONNECTION_BAD {
-        panic! ("CONNECTION_BAD: {}", error_message (conn));
-        //pending_connections.remove (idx);
+        // TODO: Log the failed connection attempt.
+        // TODO: An option not to retry too fast?
+        unsafe {pq::PQreset (conn.handle)};  // Keep trying.
       } else if status == pq::CONNECTION_OK {
-        let rc = unsafe {pq::PQsetnonblocking (conn, 1)};
-        if rc != 0 {panic! ("!PQsetnonblocking: {}", error_message (conn))}
+        let rc = unsafe {pq::PQsetnonblocking (conn.handle, 1)};
+        if rc != 0 {panic! ("!PQsetnonblocking: {}", error_message (conn.handle))}
 
         // Pipelining usually works by executing all queries in a single transaction, but we might want to avoid that
         // because we don't want a single failing query to invalidate (roll back) all DMLs that happen to share the same pipeline.
@@ -410,21 +423,21 @@ fn event_loop (rx: Receiver<Message>, read_end: c_int) {
         // and need some other means to amortize the const of many transactions being present in the pipeline.
         //
         // BDR defaults to asynchronous commits anyway, cf. http://bdr-project.org/docs/stable/bdr-configuration-variables.html#GUC-BDR-SYNCHRONOUS-COMMIT
-        let rc = unsafe {pq::PQsendQuery (conn, "SET synchronous_commit = off\0".as_ptr() as *const c_char)};
-        if rc == 0 {panic! ("!PQsendQuery: {}", error_message (conn))}
+        let rc = unsafe {pq::PQsendQuery (conn.handle, "SET synchronous_commit = off\0".as_ptr() as *const c_char)};
+        if rc == 0 {panic! ("!PQsendQuery: {}", error_message (conn.handle))}
 
-        good_connections.push (Connection {conn: conn, in_flight: VecDeque::new(), in_flight_init: true});
-        pending_connections.remove (idx);
+        conn.pending = false;
+        conn.in_flight_init = true;
       } else {
-        let sock = unsafe {pq::PQsocket (conn)};
-        match unsafe {pq::PQconnectPoll (conn)} {
+        let sock = unsafe {pq::PQsocket (conn.handle)};
+        match unsafe {pq::PQconnectPoll (conn.handle)} {
           pq::PGRES_POLLING_READING => fds.push (PollFd::new (sock, poll::POLLIN, EventFlags::empty())),
           pq::PGRES_POLLING_WRITING => fds.push (PollFd::new (sock, poll::POLLOUT, EventFlags::empty())),
           _ => ()};}}
 
     // Try to find a connection that isn't currently busy.
     // (As of now, only one `PQsendQuery` can be in flight).
-    for conn in good_connections.iter_mut().filter (|conn| conn.free()) {
+    for conn in connections.iter_mut().filter (|conn| !conn.pending && conn.free()) {
       if pending_futures.is_empty() {break}
       // Join all the queries into a single batch.
       // Similar to how libpqxx pipelining works, cf.
@@ -444,8 +457,8 @@ fn event_loop (rx: Receiver<Message>, read_end: c_int) {
             &PgQueryPiece::Static (ref ss) => sql.push_str (ss),
             &PgQueryPiece::Plain (ref plain) => sql.push_str (&plain),
             &PgQueryPiece::Literal (ref literal) => {
-              let esc = unsafe {pq::PQescapeLiteral (conn.conn, literal.as_ptr() as *const c_char, literal.len())};
-              if esc == null_mut() {panic! ("!PQescapeLiteral: {}", error_message (conn.conn))}
+              let esc = unsafe {pq::PQescapeLiteral (conn.handle, literal.as_ptr() as *const c_char, literal.len())};
+              if esc == null_mut() {panic! ("!PQescapeLiteral: {}", error_message (conn.handle))}
               sql.push_str (unsafe {CStr::from_ptr (esc)} .to_str().expect ("!esc"));
               unsafe {pq::PQfreemem (esc as *mut c_void)};}}}
         // Wrap every command in a separate transaction in order not to loose the DML changes when there is an erroneous statement in the pipeline.
@@ -453,41 +466,58 @@ fn event_loop (rx: Receiver<Message>, read_end: c_int) {
         sql_futures.push (pending)}
 
       // NB: We need this call to flip a flag in libpq, particularly when the loop that process the results finishes early.
-      let res = unsafe {pq::PQgetResult (conn.conn)};
+      let res = unsafe {pq::PQgetResult (conn.handle)};
       if res != null_mut() {panic! ("Stray result detected before PQsendQuery! {:?}", res);}
 
       let sql = CString::new (&sql[..]) .expect ("!sql");
-      let rc = unsafe {pq::PQsendQuery (conn.conn, sql.as_ptr())};
-      if rc == 0 {panic! ("!PQsendQuery: {}", error_message (conn.conn))}
+      let rc = unsafe {pq::PQsendQuery (conn.handle, sql.as_ptr())};
+      if rc == 0 {
+        let err = error_message (conn.handle);
+        if err.starts_with ("server closed the connection unexpectedly") {
+          // Experimental reconnection support.
+          // TODO: Log the reconnection.
+          unsafe {pq::PQreset (conn.handle)};
+          conn.pending = true;
+          // Reschedule the futures.
+          pending_futures.extend (sql_futures.drain (..));
+          continue}
+        panic! ("!PQsendQuery: {}", error_message (conn.handle))}
       conn.in_flight.extend (sql_futures.drain (..));}
 
-    for conn in good_connections.iter_mut() {
+    'connections_loop: for conn in connections.iter_mut().filter (|conn| !conn.pending) {
       if !conn.free() {
-        let sock = unsafe {pq::PQsocket (conn.conn)};
+        let sock = unsafe {pq::PQsocket (conn.handle)};
 
-        let rc = unsafe {pq::PQconsumeInput (conn.conn)};
-        if rc != 1 {panic! ("!PQconsumeInput: {}", error_message (conn.conn))}
+        let rc = unsafe {pq::PQconsumeInput (conn.handle)};
+        if rc != 1 {
+          let err = error_message (conn.handle);
+          if err.starts_with ("server closed the connection unexpectedly") {
+            // Experimental reconnection support.
+            // TODO: Log the reconnection.
+            unsafe {pq::PQreset (conn.handle)};
+            conn.pending = true;
+            continue 'connections_loop}
+          panic! ("!PQconsumeInput: {}", err)}
 
-        let rc = unsafe {pq::PQflush (conn.conn)};
+        let rc = unsafe {pq::PQflush (conn.handle)};
         if rc == 1 {fds.push (PollFd::new (sock, poll::POLLOUT, EventFlags::empty()))}
 
         loop {
-          if unsafe {pq::PQisBusy (conn.conn)} == 1 {break}
+          if unsafe {pq::PQisBusy (conn.handle)} == 1 {break}
           let mut error = false;
           let mut after_future = false;
           if conn.in_flight_init {
             conn.in_flight_init = false;
-            let res = unsafe {pq::PQgetResult (conn.conn)};
+            let res = unsafe {pq::PQgetResult (conn.handle)};
             if res == null_mut() {panic! ("Got no result for in_flight_init statement")}
             error = error_in_result (res) .is_some()
           } else {
             let pg_future = match conn.in_flight.pop_front() {Some (f) => f, None => break};
-            let mut sync = pg_future.0.sync.lock().expect ("!lock");
             after_future = true;
 
             // Every statement is wrapped in a "BEGIN; SELECT $id; $statement; COMMIT" transaction and produces not one but three results.
 
-            { let begin_res = unsafe {pq::PQgetResult (conn.conn)};
+            { let begin_res = unsafe {pq::PQgetResult (conn.handle)};
               if begin_res == null_mut() {panic! ("Got no BEGIN result for {:?}", pg_future)}
               if let Some (error_status) = error_in_result (begin_res) {
                 // BEGIN fails when there is a syntax error in the pipeline SQL.
@@ -503,13 +533,26 @@ fn event_loop (rx: Receiver<Message>, read_end: c_int) {
                 //error = true;
 
                 // But for now it might be better if we just panic. SQL is code and syntax errors aren't usually expected.
+                let sqlstate = unsafe {CStr::from_ptr (pq::PQresultErrorField (begin_res, pq::PG_DIAG_SQLSTATE))} .to_str() .expect ("!to_str");
+                if sqlstate == "57P01" {
+                  // Experimental reconnection support.
+                  // TODO: Log the reconnection.
+                  unsafe {pq::PQreset (conn.handle)};
+                  conn.pending = true;
+                  // Reschedule the futures.
+                  pending_futures.push_back (pg_future);
+                  pending_futures.extend (conn.in_flight.drain (..));
+                  continue 'connections_loop}
+
                 let status = unsafe {CStr::from_ptr (pq::PQresStatus (error_status))} .to_str() .expect ("!to_str");
                 let err = unsafe {CStr::from_ptr (pq::PQresultErrorMessage (begin_res))} .to_str() .expect ("!to_str");
-                panic! ("BEGIN failed. Probably a syntax error in one of the pipelined SQL statements. {},\n{}", status, err);}
+                panic! ("BEGIN failed. Probably a syntax error in one of the pipelined SQL statements. {}, {},\n{}", status, sqlstate, err);}
               unsafe {pq::PQclear (begin_res)} }
 
+            let mut sync = pg_future.0.sync.lock().expect ("!lock");
+
             if !error { // Check that we're getting results for the right future.
-              let id_res = unsafe {pq::PQgetResult (conn.conn)};
+              let id_res = unsafe {pq::PQgetResult (conn.handle)};
               if id_res == null_mut() {panic! ("Got no ID result for {:?}", pg_future)}
               if error_in_result (id_res) .is_some() {panic! ("Error in ID")}
               assert_eq! (unsafe {pq::PQntuples (id_res)}, 1);
@@ -523,7 +566,7 @@ fn event_loop (rx: Receiver<Message>, read_end: c_int) {
             sync.results.reserve_exact (expect_results);
             for num in 0..expect_results {
               if error {break}
-              let statement_res = unsafe {pq::PQgetResult (conn.conn)};
+              let statement_res = unsafe {pq::PQgetResult (conn.handle)};
               if statement_res == null_mut() {panic! ("Got no statement {} result for {:?}", num, pg_future)}
               error = error_in_result (statement_res) .is_some();
               sync.results.push (PgResult {  // NB: `PgResult` takes responsibility to `PQclear` the `statement_res`.
@@ -536,13 +579,13 @@ fn event_loop (rx: Receiver<Message>, read_end: c_int) {
           if error {
             if after_future {
               // Need to call `PQgetResult` one last time in order to flip a flag in libpq. Otherwise `PQsendQuery` won't work.
-              let res = unsafe {pq::PQgetResult (conn.conn)};
+              let res = unsafe {pq::PQgetResult (conn.handle)};
               if res != null_mut() {panic! ("Unexpected result after an error")}
 
               // We're using BEGIN-COMMIT, so we should ROLLBACK after a failure.
               // Otherwise we'll see "current transaction is aborted, commands ignored until end of transaction block".
-              let rc = unsafe {pq::PQsendQuery (conn.conn, "ROLLBACK\0".as_ptr() as *const c_char)};
-              if rc == 0 {panic! ("!PQsendQuery: {}", error_message (conn.conn))}
+              let rc = unsafe {pq::PQsendQuery (conn.handle, "ROLLBACK\0".as_ptr() as *const c_char)};
+              if rc == 0 {panic! ("!PQsendQuery: {}", error_message (conn.handle))}
               conn.in_flight_init = true}
 
             // If a statement fails then the rest of the pipeline fails. Reschedule the remaining futures.
@@ -554,8 +597,7 @@ fn event_loop (rx: Receiver<Message>, read_end: c_int) {
     let rc = poll::poll (&mut fds, 100) .expect ("!poll");
     if rc == -1 {panic! ("!poll: {}", io::Error::last_os_error())}}
 
-  for conn in good_connections {unsafe {pq::PQfinish (conn.conn)}}
-  for conn in pending_connections {unsafe {pq::PQfinish (conn)}}}
+  for conn in connections {unsafe {pq::PQfinish (conn.handle)}}}
 
 /// A cluster of several replicated PostgreSQL nodes.
 pub struct Cluster {
@@ -676,6 +718,12 @@ pub mod pq {  // cf. "bindgen /usr/include/postgresql/libpq-fe.h".
 
   pub type Oid = c_uint;
 
+  // PG_DIAG_* constants are defined in /usr/include/postgresql/postgres_ext.h
+
+  /// According to https://www.postgresql.org/message-id/20041202060648.GA60984%40winnie.fuhr.org
+  /// returns a error code from https://www.postgresql.org/docs/9.4/static/errcodes-appendix.html.
+  pub const PG_DIAG_SQLSTATE: c_int = 'C' as c_int;
+
   #[link(name = "pq")] extern {
     /// https://www.postgresql.org/docs/9.4/static/libpq-threading.html
     pub fn PQisthreadsafe() -> c_int;
@@ -685,6 +733,8 @@ pub mod pq {  // cf. "bindgen /usr/include/postgresql/libpq-fe.h".
     pub fn PQconnectStart (conninfo: *const c_char) -> *mut PGconn;
     /// https://www.postgresql.org/docs/9.4/static/libpq-status.html#LIBPQ-PQSTATUS
     pub fn PQstatus (conn: *const PGconn) -> ConnStatusType;
+    /// https://www.postgresql.org/docs/9.4/static/libpq-connect.html#LIBPQ-PQRESET
+    pub fn PQreset (conn: *const PGconn);
     /// https://www.postgresql.org/docs/9.4/static/libpq-connect.html#LIBPQ-PQCONNECTSTARTPARAMS
     pub fn PQconnectPoll (conn: *mut PGconn) -> PostgresPollingStatusType;
     /// https://www.postgresql.org/docs/9.4/static/libpq-status.html#LIBPQ-PQSOCKET
@@ -713,6 +763,8 @@ pub mod pq {  // cf. "bindgen /usr/include/postgresql/libpq-fe.h".
     pub fn PQresStatus (status: ExecStatusType) -> *mut c_char;
     /// https://www.postgresql.org/docs/9.4/static/libpq-exec.html#LIBPQ-PQRESULTERRORMESSAGE
     pub fn PQresultErrorMessage (res: *const PGresult) -> *mut c_char;
+    /// https://www.postgresql.org/docs/9.4/static/libpq-exec.html#LIBPQ-PQRESULTERRORFIELD
+    pub fn PQresultErrorField (res: *const PGresult, fieldcode: c_int) -> *mut c_char;
     /// https://www.postgresql.org/docs/9.4/static/libpq-exec.html#LIBPQ-PQNTUPLES
     pub fn PQntuples (res: *const PGresult) -> c_int;
     /// https://www.postgresql.org/docs/9.4/static/libpq-exec.html#LIBPQ-PQNFIELDS
@@ -736,5 +788,4 @@ pub mod pq {  // cf. "bindgen /usr/include/postgresql/libpq-fe.h".
     /// https://www.postgresql.org/docs/9.4/static/libpq-exec.html#LIBPQ-PQCLEAR
     pub fn PQclear (result: *mut PGresult);
     /// https://www.postgresql.org/docs/9.4/static/libpq-status.html#LIBPQ-PQERRORMESSAGE
-    pub fn PQerrorMessage (conn: *const PGconn) -> *const c_char;
-} }
+    pub fn PQerrorMessage (conn: *const PGconn) -> *const c_char;}}
