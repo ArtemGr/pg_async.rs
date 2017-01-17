@@ -3,8 +3,11 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](http://keepachangelog.com/) and this project adheres to [Semantic Versioning](http://semver.org/).
 
+### [0.3.4] - 2017-01-17
+`+` A way to escape binary data was added (Bytea).
+
 ### [0.3.3] - 2017-01-11
-`+` Experimental reconnection support.
+`+` Experimental reconnection support.  
 `+` SQLSTATE error code is copied to `PgSqlErr` errors.
 
 ### [0.3.2] - 2017-01-10

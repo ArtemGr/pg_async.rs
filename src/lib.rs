@@ -15,7 +15,7 @@ extern crate serde_json;
 
 use futures::{Future, Poll, Async};
 use futures::task::{park, Task};
-use libc::{c_char, c_int, c_void};
+use libc::{c_char, c_int, c_void, size_t};
 use nix::poll::{self, EventFlags, PollFd};
 use nix::fcntl::{O_NONBLOCK, O_CLOEXEC};
 use serde_json::{Value as Json};
@@ -45,7 +45,9 @@ pub enum PgQueryPiece {
   /// Plain strings are included in the query "as is".
   Plain (String),
   /// Literals are escaped with `PQescapeLiteral` (which also places them into the single quotes).
-  Literal (String)}
+  Literal (String),
+  /// Binary data, escaped with `PQescapeByteaConn`.
+  Bytea (Vec<u8>)}
 
 /// Converts the `fn execute` input into a vector of query pieces.
 pub trait IntoQueryPieces {
@@ -107,7 +109,21 @@ impl<'a> PgRow<'a> {
   /// Returns an empty string if the value is NULL.
   pub fn col_str (&self, column: u32) -> Result<&'a str, std::str::Utf8Error> {
     if column > self.0.columns {panic! ("Column index {} is out of range (0..{})", column, self.0.columns)}
-    unsafe {CStr::from_ptr (pq::PQgetvalue ((self.0).res, self.1 as c_int, column as c_int))} .to_str()}}
+    unsafe {CStr::from_ptr (pq::PQgetvalue ((self.0).res, self.1 as c_int, column as c_int))} .to_str()}
+
+  /// Binary data unescaped from a bytea column.
+  pub fn bytea (&self, column: u32) -> Vec<u8> {
+    if column > self.0.columns {panic! ("Column index {} is out of range (0..{})", column, self.0.columns)}
+    let mut len: size_t = 0;
+    let mut vec = Vec::new();
+    unsafe {
+      let value = pq::PQgetvalue ((self.0).res, self.1 as c_int, column as c_int);
+      let bytes = pq::PQunescapeBytea (value as *const u8, &mut len);
+      if bytes != null_mut() {
+        vec.reserve_exact (len);
+        vec.extend_from_slice (from_raw_parts (bytes, len));
+        pq::PQfreemem (bytes as *mut c_void);}}
+    vec}}
 
 fn is_alphabetic (ch:u8) -> bool {
   (ch >= 0x41 && ch <= 0x5A) || (ch >= 0x61 && ch <= 0x7A)}
@@ -460,6 +476,14 @@ fn event_loop (rx: Receiver<Message>, read_end: c_int) {
               let esc = unsafe {pq::PQescapeLiteral (conn.handle, literal.as_ptr() as *const c_char, literal.len())};
               if esc == null_mut() {panic! ("!PQescapeLiteral: {}", error_message (conn.handle))}
               sql.push_str (unsafe {CStr::from_ptr (esc)} .to_str().expect ("!esc"));
+              unsafe {pq::PQfreemem (esc as *mut c_void)};},
+            &PgQueryPiece::Bytea (ref bytes) => {
+              let mut escaped_size: size_t = 0;
+              let esc = unsafe {pq::PQescapeByteaConn (conn.handle, bytes.as_ptr(), bytes.len(), &mut escaped_size)};
+              if esc == null_mut() {panic! ("!PQescapeByteaConn: {}", error_message (conn.handle))}
+              assert! (escaped_size > 0);  // NB: Includes the terminating zero byte.
+              let esc_slice = unsafe {from_raw_parts (esc, escaped_size - 1)};
+              sql.push_str (unsafe {from_utf8_unchecked (esc_slice)});
               unsafe {pq::PQfreemem (esc as *mut c_void)};}}}
         // Wrap every command in a separate transaction in order not to loose the DML changes when there is an erroneous statement in the pipeline.
         sql.push_str ("; COMMIT");
@@ -469,7 +493,7 @@ fn event_loop (rx: Receiver<Message>, read_end: c_int) {
       let res = unsafe {pq::PQgetResult (conn.handle)};
       if res != null_mut() {panic! ("Stray result detected before PQsendQuery! {:?}", res);}
 
-      let sql = CString::new (&sql[..]) .expect ("!sql");
+      let sql = CString::new (&sql[..]) .expect ("sql !CString");
       let rc = unsafe {pq::PQsendQuery (conn.handle, sql.as_ptr())};
       if rc == 0 {
         let err = error_message (conn.handle);
@@ -651,7 +675,7 @@ impl Cluster {
   /// To avoid SQL injection one might use the escapes provided by `PgQueryPiece`:
   ///
   /// ```
-  ///   use pg_async::PgQueryPiece::{Static as S, Literal as L};
+  ///   use pg_async::PgQueryPiece::{Static as S, Plain as P, Literal as L, Bytea as B};
   ///   cluster.execute (vec! [S ("SELECT * FROM foo WHERE bar = "), L (bar)]);
   /// ```
   pub fn execute<I: IntoQueryPieces> (&self, sql: I) -> Result<PgFuture, String> {
@@ -744,7 +768,11 @@ pub mod pq {  // cf. "bindgen /usr/include/postgresql/libpq-fe.h".
     /// https://www.postgresql.org/docs/9.4/static/libpq-connect.html#LIBPQ-PQFINISH
     pub fn PQfinish (conn: *mut PGconn);
     /// https://www.postgresql.org/docs/9.4/static/libpq-exec.html#LIBPQ-EXEC-ESCAPE-STRING
-    pub fn PQescapeLiteral (conn: *mut PGconn, str: *const c_char, len: size_t) -> *mut c_char;
+    pub fn PQescapeLiteral (conn: *const PGconn, str: *const c_char, len: size_t) -> *mut c_char;
+    /// https://www.postgresql.org/docs/9.4/static/libpq-exec.html#LIBPQ-PQESCAPEBYTEACONN
+    pub fn PQescapeByteaConn (conn: *const PGconn, from: *const u8, from_length: size_t, to_length: *mut size_t) -> *mut u8;
+    /// https://www.postgresql.org/docs/9.4/static/libpq-exec.html#LIBPQ-PQUNESCAPEBYTEA
+    pub fn PQunescapeBytea (from: *const u8, to_length: *mut size_t)-> *mut u8;
     /// https://www.postgresql.org/docs/9.4/static/libpq-misc.html#LIBPQ-PQFREEMEM
     pub fn PQfreemem (ptr: *mut c_void);
     /// https://www.postgresql.org/docs/9.4/static/libpq-async.html#LIBPQ-PQSENDQUERY
