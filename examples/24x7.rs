@@ -1,4 +1,5 @@
 // Run me with "cargo run --example 24x7".
+// Or "cargo run --example 24x7 -- --pin=0"
 
 #![feature(type_ascription, integer_atomics)]
 
@@ -12,9 +13,11 @@ extern crate rand;
 use futures::future::Future;
 use futures_cpupool::CpuPool;
 use gstuff::{status_line, ISATTY};
-use pg_async::Cluster;
+use pg_async::{Cluster, PgOperation, PgSchedulingMode};
+use pg_async::PgQueryPiece::{Plain as P};
 use rand::{StdRng, Rng};
 use std::collections::BTreeMap;
+use std::env::args;
 use std::fs;
 use std::io::{self, BufRead};
 use std::sync::{Arc, Mutex};
@@ -30,6 +33,9 @@ fn main() {
 
   println! ("This program just keeps talking with the database servers forever.");
 
+  let pin: Option<u8> = args().find (|a| a.starts_with ("--pin=")) .map (|a| (&a[6..]).parse().expect ("!parse"));
+  if let Some (pin) = pin {println! ("Operations are pinned to connection {}.", pin);}
+
   let mut rng = StdRng::new().expect ("!rng");
   let mut slash = '/';
   let finished = Arc::new (AtomicU64::new (0));
@@ -39,7 +45,16 @@ fn main() {
   loop {
     for _ in 0..99 {  // Generate a decent load spike to ensure that all the connections are busy and pipelining.
       let rid = rng.next_u64();
-      let f = cluster.execute (fomat! ("SELECT " (rid) " AS rid")) .expect ("!execute");
+
+      let f = match pin {
+        None => cluster.execute (fomat! ("SELECT " (rid) " AS rid")) .expect ("!execute"),
+        Some (pin) => {
+          cluster.execute (PgOperation {
+            scheduling: PgSchedulingMode::PinToConnection (pin),
+            statements: 1,
+            query_pieces: vec! [P (fomat! ("SELECT " (rid) " AS rid"))]
+          }) .expect ("!execute")}};
+
       let f: Box<Future<Item=(), Error=()> + Send> = {
         let finished = finished.clone();
         let errors = errors.clone();

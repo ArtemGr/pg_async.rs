@@ -3,6 +3,9 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](http://keepachangelog.com/) and this project adheres to [Semantic Versioning](http://semver.org/).
 
+### [0.3.5] - 2017-01-19
+`+` Operations can now be pinned to a particular connection.
+
 ### [0.3.4] - 2017-01-17
 `+` A way to escape binary data was added (Bytea).
 

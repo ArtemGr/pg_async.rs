@@ -1,13 +1,13 @@
 [package]
 name = "pg_async"
-version = "0.3.4"
+version = "0.3.5"
 authors = ["Artem <artemciy@gmail.com>"]
 links = "pq"
 build = "build.rs"
 description = "Asynchronous, HA (master-master) PostgreSQL driver on top of libpq"
 documentation = "https://docs.rs/pg_async/"
 repository = "https://github.com/ArtemGr/pg_async.rs"
-keywords = ["futures", "high-availability"]
+keywords = ["sql", "database", "postgres", "futures", "high-availability"]
 license = "MIT"
 
 [lib]
@@ -32,6 +32,6 @@ name = "24x7"
 path = "examples/24x7.rs"
 
 [dev-dependencies]
-fomat-macros = "0.1"
+fomat-macros = "0.2"
 futures-cpupool = "0.1"
 rand = "0.3"

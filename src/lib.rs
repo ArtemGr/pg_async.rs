@@ -37,7 +37,12 @@ use std::thread::JoinHandle;
 
 /// A part of an SQL query text. The query is constructed by adding `Plain` pieces "as is" and escaping the `Literal` pieces.
 ///
-/// For example, `vec! [PgQueryPiece::Plain ("SELECT ".into()), PgQueryPiece::Literal ("foo".into)]` becomes "SELECT 'foo'".
+/// For example, a properly escaped "SELECT 'foo'" might be generated with
+///
+/// ```
+///     use pg_async::PgQueryPiece::{Static as S, Literal as L};
+///     vec![S("SELECT "), L("foo".into)]
+/// ```
 #[derive(Debug)]
 pub enum PgQueryPiece {
   /// Static strings are included in the query "as is".
@@ -49,32 +54,58 @@ pub enum PgQueryPiece {
   /// Binary data, escaped with `PQescapeByteaConn`.
   Bytea (Vec<u8>)}
 
+/// Affects the placement of the operation.
+#[derive (Debug)]
+pub enum PgSchedulingMode {
+  /// The operation can be run on any connection, retried and rescheduled to another connection.
+  AnythingGoes,
+  /// The op must only run on the connection with the given number (0-based).
+  /// If the connection is not available (the server is down or inaccessible) then the operation might stay in the queue forever.
+  PinToConnection (u8)}
+
+/// An atomic operation that is to be asynchronously executed.
+#[derive (Debug)]
+pub struct PgOperation {
+  /// Parts of SQL test, some of which are to be escaped and some are not.
+  ///
+  /// Might contain several SQL statements (the number of statements MUST match the number in the `statements` field).
+  pub query_pieces: Vec<PgQueryPiece>,
+  /// The number of separate top-level SQL statements withing `query_pieces`. E.g. the number of results PostgreSQL will return.
+  pub statements: u32,
+  /// Affects the placement of the operation.
+  pub scheduling: PgSchedulingMode}
+
 /// Converts the `fn execute` input into a vector of query pieces.
 pub trait IntoQueryPieces {
   /// Returns the number of SQL statements (the library must know how many results to expect) and the list of pieces to escape and join.
-  fn into_query_pieces (self) -> (u32, Vec<PgQueryPiece>);}
+  fn into_query_pieces (self) -> PgOperation;}
 
 impl IntoQueryPieces for String {
-  fn into_query_pieces (self) -> (u32, Vec<PgQueryPiece>) {
-    (1, vec! [PgQueryPiece::Plain (self)])}}
+  fn into_query_pieces (self) -> PgOperation {
+    PgOperation {statements: 1, query_pieces: vec! [PgQueryPiece::Plain (self)], scheduling: PgSchedulingMode::AnythingGoes}}}
 
 impl IntoQueryPieces for &'static str {
-  fn into_query_pieces (self) -> (u32, Vec<PgQueryPiece>) {
-    (1, vec! [PgQueryPiece::Static (self)])}}
+  fn into_query_pieces (self) -> PgOperation {
+    PgOperation {statements: 1, query_pieces: vec! [PgQueryPiece::Static (self)], scheduling: PgSchedulingMode::AnythingGoes}}}
 
 impl<'a> IntoQueryPieces for Vec<PgQueryPiece> {
-  fn into_query_pieces (self) -> (u32, Vec<PgQueryPiece>) {(1, self)}}
+  fn into_query_pieces (self) -> PgOperation {
+    PgOperation {statements: 1, query_pieces: self, scheduling: PgSchedulingMode::AnythingGoes}}}
 
 impl IntoQueryPieces for (u32, &'static str) {
-  fn into_query_pieces (self) -> (u32, Vec<PgQueryPiece>) {
-    (self.0, vec! [PgQueryPiece::Static (self.1)])}}
+  fn into_query_pieces (self) -> PgOperation {
+    PgOperation {statements: self.0, query_pieces: vec! [PgQueryPiece::Static (self.1)], scheduling: PgSchedulingMode::AnythingGoes}}}
 
 impl IntoQueryPieces for (u32, String) {
-  fn into_query_pieces (self) -> (u32, Vec<PgQueryPiece>) {
-    (self.0, vec! [PgQueryPiece::Plain (self.1)])}}
+  fn into_query_pieces (self) -> PgOperation {
+    PgOperation {statements: self.0, query_pieces: vec! [PgQueryPiece::Plain (self.1)], scheduling: PgSchedulingMode::AnythingGoes}}}
 
 impl IntoQueryPieces for (u32, Vec<PgQueryPiece>) {
-  fn into_query_pieces (self) -> (u32, Vec<PgQueryPiece>) {self}}
+  fn into_query_pieces (self) -> PgOperation {
+    PgOperation {statements: self.0, query_pieces: self.1, scheduling: PgSchedulingMode::AnythingGoes}}}
+
+impl IntoQueryPieces for PgOperation {
+  fn into_query_pieces (self) -> PgOperation {self}}
 
 pub struct PgRow<'a> (&'a PgResult, u32);
 
@@ -229,9 +260,7 @@ struct PgFutureSync {
 
 struct PgFutureImpl {
   id: u64,
-  /// The number of separate top-level SQL statements withing the `sql`. E.g. the number of results PostgreSQL will return.
-  statements: u32,
-  sql: Vec<PgQueryPiece>,
+  op: PgOperation,
   sync: Mutex<PgFutureSync>}
 
 /// The part of `PgFutureErr` that's used when the SQL fails.
@@ -266,7 +295,7 @@ impl fmt::Debug for PgFutureErr {
     match self {
       &PgFutureErr::PoisonError => ft.write_str ("PgFutureErr::PoisonError"),
       &PgFutureErr::Utf8Error (ref err) => write! (ft, "PgFutureErr::Utf8Error ({:?})", err),
-      &PgFutureErr::Sql (ref se) => write! (ft, "PgFutureErr ({:?}, {}, {})", se.imp.sql, se.sqlstate, se.message),
+      &PgFutureErr::Sql (ref se) => write! (ft, "PgFutureErr ({:?}, {}, {})", se.imp.op.query_pieces, se.sqlstate, se.message),
       &PgFutureErr::Json (ref err) => write! (ft, "PgFutureErr::Json ({:?})", err),
       &PgFutureErr::Int (ref err) => write! (ft, "PgFutureErr::Int ({:?})", err),
       &PgFutureErr::Float (ref err) => write! (ft, "PgFutureErr::Float ({:?})", err),
@@ -319,18 +348,17 @@ impl From<std::num::ParseFloatError> for PgFutureErr {
 pub struct PgFuture (Arc<PgFutureImpl>);
 
 impl PgFuture {
-  fn new (id: u64, statements: u32, sql: Vec<PgQueryPiece>) -> PgFuture {
+  fn new (id: u64, op: PgOperation) -> PgFuture {
     PgFuture (Arc::new (PgFutureImpl {
       id: id,
-      statements: statements,
-      sql: sql,
+      op: op,
       sync: Mutex::new (PgFutureSync {
         results: Vec::new(),
         task: None})}))}}
 
 impl fmt::Debug for PgFuture {
   fn fmt (&self, ft: &mut fmt::Formatter) -> Result<(), fmt::Error> {
-    write! (ft, "PgFuture ({}, {:?})", self.0.id, self.0.sql)}}
+    write! (ft, "PgFuture ({}, {:?})", self.0.id, self.0.op)}}
 
 impl Future for PgFuture {
   type Item = Vec<PgResult>;
@@ -371,8 +399,10 @@ struct Connection {
   dsn: String,
   handle: *mut pq::PGconn,
   in_flight: VecDeque<PgFuture>,
+  /// Incoming futures pinned to this particular connection.
+  pinned_pending_futures: VecDeque<PgFuture>,
   /// True if we're waiting for the server connection to happen.
-  pending: bool,
+  connection_pending: bool,
   /// True if there is an internal statement in flight.
   in_flight_init: bool}
 
@@ -397,10 +427,21 @@ fn event_loop (rx: Receiver<Message>, read_end: c_int) {
   use std::fmt::Write;
 
   let mut connections: Vec<Connection> = Vec::new();
-  let mut fds = Vec::new();
   let mut pending_futures: VecDeque<PgFuture> = VecDeque::new();
   let mut sql = String::with_capacity (PIPELINE_LIM_BYTES + 1024);
   let mut sql_futures = Vec::with_capacity (PIPELINE_LIM_COMMANDS);
+
+  macro_rules! schedule {($pg_future: ident) => {{
+    match $pg_future.0.op.scheduling {
+      PgSchedulingMode::AnythingGoes => pending_futures.push_back ($pg_future),
+      PgSchedulingMode::PinToConnection (n) => connections[n as usize].pinned_pending_futures.push_back ($pg_future)}}}};
+
+  macro_rules! reschedule {($conn: ident, $pg_future: ident) => {{
+    match $pg_future.0.op.scheduling {
+      PgSchedulingMode::AnythingGoes => pending_futures.push_back ($pg_future),
+      PgSchedulingMode::PinToConnection (_) => $conn.pinned_pending_futures.push_back ($pg_future)}}}};
+
+  let mut fds = Vec::new();
   'event_loop: loop {
     { let mut tmp: [u8; 256] = unsafe {std::mem::uninitialized()}; let _ = nix::unistd::read (read_end, &mut tmp); }
     loop {match rx.try_recv() {
@@ -416,14 +457,15 @@ fn event_loop (rx: Receiver<Message>, read_end: c_int) {
               dsn: dsn.clone(),
               handle: conn,
               in_flight: VecDeque::new(),
-              pending: true,
+              pinned_pending_futures: VecDeque::new(),
+              connection_pending: true,
               in_flight_init: false});}},
-        Message::Execute (pg_future) => pending_futures.push_back (pg_future),
+        Message::Execute (pg_future) => schedule! (pg_future),
         Message::Drop => break 'event_loop}}}  // Cluster is dropping.
 
     fds.clear();
 
-    for conn in connections.iter_mut().filter (|conn| conn.pending) {
+    for conn in connections.iter_mut().filter (|conn| conn.connection_pending) {
       let status = unsafe {pq::PQstatus (conn.handle)};
       if status == pq::CONNECTION_BAD {
         // TODO: Log the failed connection attempt.
@@ -442,7 +484,7 @@ fn event_loop (rx: Receiver<Message>, read_end: c_int) {
         let rc = unsafe {pq::PQsendQuery (conn.handle, "SET synchronous_commit = off\0".as_ptr() as *const c_char)};
         if rc == 0 {panic! ("!PQsendQuery: {}", error_message (conn.handle))}
 
-        conn.pending = false;
+        conn.connection_pending = false;
         conn.in_flight_init = true;
       } else {
         let sock = unsafe {pq::PQsocket (conn.handle)};
@@ -453,8 +495,9 @@ fn event_loop (rx: Receiver<Message>, read_end: c_int) {
 
     // Try to find a connection that isn't currently busy.
     // (As of now, only one `PQsendQuery` can be in flight).
-    for conn in connections.iter_mut().filter (|conn| !conn.pending && conn.free()) {
-      if pending_futures.is_empty() {break}
+    for conn in connections.iter_mut().filter (|conn| !conn.connection_pending && conn.free()) {
+      if pending_futures.is_empty() && conn.pinned_pending_futures.is_empty() {continue}
+
       // Join all the queries into a single batch.
       // Similar to how libpqxx pipelining works, cf.
       // https://github.com/jtv/libpqxx/blob/master/include/pqxx/pipeline.hxx
@@ -465,10 +508,14 @@ fn event_loop (rx: Receiver<Message>, read_end: c_int) {
       loop {
         if sql.len() >= PIPELINE_LIM_BYTES {break}
         if sql_futures.len() + 1 >= PIPELINE_LIM_COMMANDS {break}
-        let pending = match pending_futures.pop_front() {Some (f) => f, None => break};
+        let pending = match pending_futures.pop_front() {
+          Some (f) => f,
+          None => match conn.pinned_pending_futures.pop_front() {
+            Some (f) => f,
+            None => break}};
         if first {first = false} else {sql.push_str ("; ")}
         write! (&mut sql, "BEGIN; SELECT {} AS future_id; ", pending.0.id) .expect ("!write");
-        for piece in pending.0.sql.iter() {
+        for piece in pending.0.op.query_pieces.iter() {
           match piece {
             &PgQueryPiece::Static (ref ss) => sql.push_str (ss),
             &PgQueryPiece::Plain (ref plain) => sql.push_str (&plain),
@@ -501,14 +548,13 @@ fn event_loop (rx: Receiver<Message>, read_end: c_int) {
           // Experimental reconnection support.
           // TODO: Log the reconnection.
           unsafe {pq::PQreset (conn.handle)};
-          conn.pending = true;
-          // Reschedule the futures.
-          pending_futures.extend (sql_futures.drain (..));
+          conn.connection_pending = true;
+          for future in sql_futures.drain (..) {reschedule! (conn, future)}
           continue}
         panic! ("!PQsendQuery: {}", error_message (conn.handle))}
       conn.in_flight.extend (sql_futures.drain (..));}
 
-    'connections_loop: for conn in connections.iter_mut().filter (|conn| !conn.pending) {
+    'connections_loop: for conn in connections.iter_mut().filter (|conn| !conn.connection_pending) {
       if !conn.free() {
         let sock = unsafe {pq::PQsocket (conn.handle)};
 
@@ -519,7 +565,8 @@ fn event_loop (rx: Receiver<Message>, read_end: c_int) {
             // Experimental reconnection support.
             // TODO: Log the reconnection.
             unsafe {pq::PQreset (conn.handle)};
-            conn.pending = true;
+            conn.connection_pending = true;
+            for future in conn.in_flight.drain (..) {reschedule! (conn, future)}
             continue 'connections_loop}
           panic! ("!PQconsumeInput: {}", err)}
 
@@ -562,10 +609,9 @@ fn event_loop (rx: Receiver<Message>, read_end: c_int) {
                   // Experimental reconnection support.
                   // TODO: Log the reconnection.
                   unsafe {pq::PQreset (conn.handle)};
-                  conn.pending = true;
-                  // Reschedule the futures.
-                  pending_futures.push_back (pg_future);
-                  pending_futures.extend (conn.in_flight.drain (..));
+                  conn.connection_pending = true;
+                  reschedule! (conn, pg_future);
+                  for future in conn.in_flight.drain (..) {reschedule! (conn, future)}
                   continue 'connections_loop}
 
                 let status = unsafe {CStr::from_ptr (pq::PQresStatus (error_status))} .to_str() .expect ("!to_str");
@@ -586,7 +632,7 @@ fn event_loop (rx: Receiver<Message>, read_end: c_int) {
               assert_eq! (id, pg_future.0.id);  // The check.
               unsafe {pq::PQclear (id_res)} }
 
-            let expect_results = pg_future.0.statements as usize + 1;
+            let expect_results = pg_future.0.op.statements as usize + 1;
             sync.results.reserve_exact (expect_results);
             for num in 0..expect_results {
               if error {break}
@@ -613,7 +659,7 @@ fn event_loop (rx: Receiver<Message>, read_end: c_int) {
               conn.in_flight_init = true}
 
             // If a statement fails then the rest of the pipeline fails. Reschedule the remaining futures.
-            pending_futures.extend (conn.in_flight.drain (..))}}
+            for future in conn.in_flight.drain (..) {reschedule! (conn, future)}}}
 
         fds.push (PollFd::new (sock, poll::POLLIN, EventFlags::empty()))}}
 
@@ -681,8 +727,7 @@ impl Cluster {
   pub fn execute<I: IntoQueryPieces> (&self, sql: I) -> Result<PgFuture, String> {
     self.command_num.compare_and_swap (u64::max_value(), 0, Ordering::Relaxed);  // Recycle the set of identifiers.
     let id = self.command_num.fetch_add (1, Ordering::Relaxed) + 1;
-    let (statements, pieces) = sql.into_query_pieces();
-    let pg_future = PgFuture::new (id, statements, pieces);
+    let pg_future = PgFuture::new (id, sql.into_query_pieces());
 
     try_s! (try_s! (self.tx.lock()) .send (Message::Execute (pg_future.clone())));
     try_s! (nix::unistd::write (self.write_end, &[2]));
