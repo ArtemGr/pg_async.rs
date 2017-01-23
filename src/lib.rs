@@ -18,7 +18,7 @@ use futures::task::{park, Task};
 use libc::{c_char, c_int, c_void, size_t};
 use nix::poll::{self, EventFlags, PollFd};
 use nix::fcntl::{O_NONBLOCK, O_CLOEXEC};
-use serde_json::{Value as Json};
+use serde_json::{self as json, Value as Json};
 use std::collections::{BTreeMap, VecDeque};
 use std::convert::From;
 use std::error::Error;
@@ -51,7 +51,7 @@ pub enum PgQueryPiece {
   Plain (String),
   /// Literals are escaped with `PQescapeLiteral` (which also places them into the single quotes).
   Literal (String),
-  /// Binary data, escaped with `PQescapeByteaConn`.
+  /// Binary data, escaped with `PQescapeByteaConn`. Single quotes aren't added by the escape.
   Bytea (Vec<u8>)}
 
 /// Affects the placement of the operation.
@@ -66,11 +66,12 @@ pub enum PgSchedulingMode {
 /// An atomic operation that is to be asynchronously executed.
 #[derive (Debug)]
 pub struct PgOperation {
-  /// Parts of SQL test, some of which are to be escaped and some are not.
+  /// Parts of SQL text, some of which are to be escaped and some are not.
   ///
   /// Might contain several SQL statements (the number of statements MUST match the number in the `statements` field).
   pub query_pieces: Vec<PgQueryPiece>,
-  /// The number of separate top-level SQL statements withing `query_pieces`. E.g. the number of results PostgreSQL will return.
+  /// The number of separate top-level SQL statements withing `query_pieces`.  
+  /// E.g. the number of results PostgreSQL will return.
   pub statements: u32,
   /// Affects the placement of the operation.
   pub scheduling: PgSchedulingMode}
@@ -88,7 +89,7 @@ impl IntoQueryPieces for &'static str {
   fn into_query_pieces (self) -> PgOperation {
     PgOperation {statements: 1, query_pieces: vec! [PgQueryPiece::Static (self)], scheduling: PgSchedulingMode::AnythingGoes}}}
 
-impl<'a> IntoQueryPieces for Vec<PgQueryPiece> {
+impl IntoQueryPieces for Vec<PgQueryPiece> {
   fn into_query_pieces (self) -> PgOperation {
     PgOperation {statements: 1, query_pieces: self, scheduling: PgSchedulingMode::AnythingGoes}}}
 
@@ -211,13 +212,12 @@ impl PgResult {
             20 | 21 | 23 => Json::I64 (row.col_str (column) ?. parse() ?),  // 20 - bigint, 21 - smallint, 23 - integer
             25 | 1042 | 1043 => Json::String (from_utf8 (row.col (column)) ?.into()),  // 25 - text, 1042 - char, 1043 - varchar
             700 | 701 => Json::F64 (row.col_str (column) ?. parse() ?),  // 700 - real, 701 - double precision
+            114 | 3802 => json::from_str (row.col_str (column) ?) ?,  // 114 - json, 3802 - jsonb
             // TODO (types I use):
             // 16 => Type::Bool,
-            // 114 => Type::Json,
             // 1184 => Type::TimestampTZ,
             // 1700 => Type::Numeric,
             // 3614 => Type::Tsvector,
-            // 3802 => Type::Jsonb,
             // 3926 => Type::Int8Range
             oid if oid > 16000 => {
               // OID that large belong to user-defined types.
@@ -714,8 +714,13 @@ impl Cluster {
   /// For example:
   ///
   /// ```
-  ///   cluster.execute ((2, "SELECT 1; SELECT 2"));  // Running two statements as a single op.
-  ///   cluster.execute ((3, "DELETE FROM foo; INSERT INTO foo VALUES (1); INSERT INTO foo VALUES (2)"));  // Running three statements.
+  ///   // Running two statements as a single op:
+  ///   cluster.execute ((2, "SELECT 1; SELECT 2"));
+  ///   // Running three statements:
+  ///   cluster.execute ((3, "\
+  ///     DELETE FROM foo; \
+  ///     INSERT INTO foo VALUES (1); \
+  ///     INSERT INTO foo VALUES (2)"));
   /// ```
   ///
   /// To avoid SQL injection one might use the escapes provided by `PgQueryPiece`:
