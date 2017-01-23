@@ -419,6 +419,11 @@ fn error_in_result (res: *const pq::PGresult) -> Option<pq::ExecStatusType> {
 const PIPELINE_LIM_COMMANDS: usize = 128;
 const PIPELINE_LIM_BYTES: usize = 16384;
 
+// To reconnect or to panic, that is the question...
+fn reconnect_heuristic (err: &str) -> bool {
+  err.starts_with ("server closed the connection unexpectedly") ||
+  err.starts_with ("SSL SYSCALL error")}
+
 fn event_loop (rx: Receiver<Message>, read_end: c_int) {
   // NB: Connection must not leak into other threads.
   // "One thread restriction is that no two threads attempt to manipulate the same PGconn object at the same time.
@@ -544,7 +549,7 @@ fn event_loop (rx: Receiver<Message>, read_end: c_int) {
       let rc = unsafe {pq::PQsendQuery (conn.handle, sql.as_ptr())};
       if rc == 0 {
         let err = error_message (conn.handle);
-        if err.starts_with ("server closed the connection unexpectedly") {
+        if reconnect_heuristic (&err) {
           // Experimental reconnection support.
           // TODO: Log the reconnection.
           unsafe {pq::PQreset (conn.handle)};
@@ -561,7 +566,7 @@ fn event_loop (rx: Receiver<Message>, read_end: c_int) {
         let rc = unsafe {pq::PQconsumeInput (conn.handle)};
         if rc != 1 {
           let err = error_message (conn.handle);
-          if err.starts_with ("server closed the connection unexpectedly") {
+          if reconnect_heuristic (&err) {
             // Experimental reconnection support.
             // TODO: Log the reconnection.
             unsafe {pq::PQreset (conn.handle)};

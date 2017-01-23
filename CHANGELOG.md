@@ -3,6 +3,9 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](http://keepachangelog.com/) and this project adheres to [Semantic Versioning](http://semver.org/).
 
+### [0.3.7] - 2017-01-24
+`+` Automatically reconnect after an "SSL SYSCALL error".
+
 ### [0.3.6] - 2017-01-23
 `+` In `PgResult::to_json` unpack the json and jsonb PostgreSQL types.
 
