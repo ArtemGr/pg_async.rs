@@ -8,6 +8,8 @@ description = "Asynchronous, HA (master-master) PostgreSQL driver on top of libp
 documentation = "https://docs.rs/pg_async/"
 repository = "https://github.com/ArtemGr/pg_async.rs"
 keywords = ["sql", "database", "postgres", "futures", "high-availability"]
+# https://crates.io/category_slugs
+categories = ["asynchronous", "database"]
 license = "MIT"
 
 [lib]
