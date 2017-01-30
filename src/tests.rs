@@ -13,9 +13,9 @@ lazy_static! {
   let mut results = Vec::new();
 
   for _ in 0..10 {
-    results.push ((1, cluster.execute ("SELECT 1") .expect ("!select 1")));
-    results.push ((2, cluster.execute ("SELECT 2") .expect ("!select 2")));
-    results.push ((3, cluster.execute ("SELECT 3") .expect ("!select 3")));}
+    results.push ((1, cluster.execute ("SELECT 1")));
+    results.push ((2, cluster.execute ("SELECT 2")));
+    results.push ((3, cluster.execute ("SELECT 3")));}
 
   for (expect, pr) in results {
     let pr: PgResult = pr.wait().expect ("!pr") .remove (0);
@@ -28,7 +28,7 @@ fn check_sync<T: Sync>(_: &T) {}
   let cluster = Cluster::new() .expect ("!Cluster");
   check_send (&cluster); check_sync (&cluster);
   for dsn in DSNS.iter() {cluster.connect (dsn.clone(), 1) .expect ("!connect")}
-  let f = cluster.execute ("SELECT abrakadabra") .expect ("!execute");
+  let f = cluster.execute ("SELECT abrakadabra");
   check_send (&f); check_sync (&f);
   match f.wait() {
     Err (ref err) if err.description().contains ("PGRES_FATAL_ERROR") => {check_send (err); check_sync (err)},  // Expected error.
@@ -37,7 +37,7 @@ fn check_sync<T: Sync>(_: &T) {}
   // Check how the presence of errors affects the pipeline.
   let mut ops = Vec::new();
   for i in 0..100 {ops.push (cluster.execute (
-    if i % 10 != 0 {format! ("SELECT {}", i)} else {"SELECT abrakadabra".into()}) .expect ("!execute"))}
+    if i % 10 != 0 {format! ("SELECT {}", i)} else {"SELECT abrakadabra".into()}))}
   for (op, i) in ops.into_iter().zip (0..) {
     let rc = op.wait();
     if i % 10 != 0 {
@@ -50,29 +50,29 @@ fn check_sync<T: Sync>(_: &T) {}
   let cluster = Cluster::new() .expect ("!Cluster");
   for dsn in DSNS.iter() {cluster.connect (dsn.clone(), 1) .expect ("!connect")}
 
-  let _ = cluster.execute ("DROP TABLE pg_async_durability_test") .unwrap().wait();
+  let _ = cluster.execute ("DROP TABLE pg_async_durability_test") .wait();
   std::thread::sleep (std::time::Duration::from_secs (2));  // BDR needs time to synchronize the DROP TABLE.
 
-  let _ = cluster.execute ("CREATE TABLE pg_async_durability_test (t TEXT NOT NULL PRIMARY KEY)") .unwrap().wait();
+  let _ = cluster.execute ("CREATE TABLE pg_async_durability_test (t TEXT NOT NULL PRIMARY KEY)") .wait();
   std::thread::sleep (std::time::Duration::from_secs (2));  // BDR needs time to synchronize the CREATE TABLE.
 
   let mut ops = Vec::new();
   for i in 0..100 {
     if i % 10 != 0 {
-      ops.push (cluster.execute (format! ("INSERT INTO pg_async_durability_test (t) VALUES ('{:02}')", i)) .unwrap())
+      ops.push (cluster.execute (format! ("INSERT INTO pg_async_durability_test (t) VALUES ('{:02}')", i)))
     } else {
-      ops.push (cluster.execute ("SELECT abrakadabra") .unwrap())}}  // Mix INSERTs with erroneous statements.
+      ops.push (cluster.execute ("SELECT abrakadabra"))}}  // Mix INSERTs with erroneous statements.
   for op in ops {let _ = op.wait();}
   std::thread::sleep (std::time::Duration::from_secs (1));  // Give BDR a bit of time to synchronize the INSERTs.
 
-  let rows = cluster.execute ("SELECT t FROM pg_async_durability_test ORDER BY t") .unwrap().wait().unwrap().remove (0);
+  let rows = cluster.execute ("SELECT t FROM pg_async_durability_test ORDER BY t") .wait().unwrap().remove (0);
   let mut rows = rows.iter();
   for i in 0..100 {
     if i % 10 != 0 {
       let row = rows.next().unwrap();
       assert_eq! (format! ("{:02}", i), row.col_str (0) .unwrap());}}
 
-  let _ = cluster.execute ("DROP TABLE pg_async_durability_test") .unwrap().wait();}
+  let _ = cluster.execute ("DROP TABLE pg_async_durability_test") .wait();}
 
 #[test] fn transactions() {
   let sql = "\
@@ -87,7 +87,7 @@ fn check_sync<T: Sync>(_: &T) {}
   let cluster = Cluster::new() .expect ("!Cluster");
   for dsn in DSNS.iter() {cluster.connect (dsn.clone(), 1) .expect ("!connect")}
   let mut ops = Vec::new();
-  for _ in 0..9 {ops.push (cluster.execute ((7, sql)) .unwrap())}
+  for _ in 0..9 {ops.push (cluster.execute ((7, sql)))}
   for op in ops {
     let rows = op.wait().unwrap().remove (6);  // SELECT is the 6th statement.
     assert_eq! (rows.row (0) .col (0), b"4");}}

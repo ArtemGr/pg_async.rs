@@ -47,13 +47,13 @@ fn main() {
       let rid = rng.next_u64();
 
       let f = match pin {
-        None => cluster.execute (fomat! ("SELECT " (rid) " AS rid")) .expect ("!execute"),
+        None => cluster.execute (fomat! ("SELECT " (rid) " AS rid")),
         Some (pin) => {
           cluster.execute (PgOperation {
             scheduling: PgSchedulingMode::PinToConnection (pin),
             statements: 1,
             query_pieces: vec! [P (fomat! ("SELECT " (rid) " AS rid"))]
-          }) .expect ("!execute")}};
+          })}};
 
       let f: Box<Future<Item=(), Error=()> + Send> = {
         let finished = finished.clone();

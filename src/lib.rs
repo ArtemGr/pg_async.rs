@@ -8,7 +8,7 @@
 extern crate futures;
 #[macro_use] extern crate gstuff;
 extern crate itertools;
-#[macro_use] extern crate lazy_static;
+#[cfg(test)] #[macro_use] extern crate lazy_static;
 extern crate libc;
 extern crate nix;
 extern crate serde_json;
@@ -30,7 +30,7 @@ use std::slice::from_raw_parts;
 use std::str::{from_utf8_unchecked, from_utf8, Utf8Error};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{channel, Sender, Receiver, TryRecvError};
+use std::sync::mpsc::{channel, Sender, Receiver, SendError, TryRecvError};
 use std::thread::JoinHandle;
 
 #[cfg(test)] mod tests;
@@ -155,7 +155,39 @@ impl<'a> PgRow<'a> {
         vec.reserve_exact (len);
         vec.extend_from_slice (from_raw_parts (bytes, len));
         pq::PQfreemem (bytes as *mut c_void);}}
-    vec}}
+    vec}
+
+  /// Convers the row into JSON, {$name: $value, ...}.
+  pub fn to_json (&self) -> Result<Json, PgFutureErr> {
+    let mut jrow: BTreeMap<String, Json> = BTreeMap::new();
+    for column in 0 .. self.0.columns {
+      let name = self.fname (column)?;
+      let jval = if self.is_null (column) {
+        Json::Null
+      } else {
+        match self.ftype (column) {
+          20 | 21 | 23 => Json::I64 (self.col_str (column) ?. parse() ?),  // 20 bigint, 21 smallint, 23 integer
+          25 | 1042 | 1043 | 3614 => Json::String (from_utf8 (self.col (column)) ?.into()),  // 25 text, 1042 char, 1043 varchar, 3614 tsvector
+          700 | 701 => Json::F64 (self.col_str (column) ?. parse() ?),  // 700 real, 701 double precision
+          114 | 3802 => json::from_str (self.col_str (column) ?) ?,  // 114 json, 3802 jsonb
+          // TODO (types I use):
+          // 16 => Type::Bool,
+          // 1184 => Type::TimestampTZ,
+          // 1700 => Type::Numeric,
+          // 3926 => Type::Int8Range
+          oid if oid > 16000 => {
+            // OID that large belong to user-defined types.
+            // We support enums by stringifying all user types in case they are ASCII.
+            // (I wonder if we could use `#define ANYENUMOID 3500` somehow to better detect if the OID is enum).
+            let bytes = self.col (column);
+            if bytes.is_empty() {return Err (PgFutureErr::UnknownType (String::from (name), oid))}
+            for &ch in bytes.iter() {
+              if !is_alphabetic (ch) && !is_digit (ch) && ch != b'_' && ch != b'-' && ch != b'.' {
+                return Err (PgFutureErr::UnknownType (String::from (name), oid))}}
+            Json::String (unsafe {from_utf8_unchecked (bytes)} .into())},
+          oid => return Err (PgFutureErr::UnknownType (String::from (name), oid))}};
+      jrow.insert (String::from (name), jval);}
+    Ok (Json::Object (jrow))}}
 
 fn is_alphabetic (ch:u8) -> bool {
   (ch >= 0x41 && ch <= 0x5A) || (ch >= 0x61 && ch <= 0x7A)}
@@ -201,37 +233,7 @@ impl PgResult {
   /// Convers a PostgreSQL query result into a JSON array of rows, [{$name: $value, ...}, ...].
   pub fn to_json (&self) -> Result<Json, PgFutureErr> {
     let mut jrows: Vec<Json> = Vec::with_capacity (self.len() as usize);
-    for row in self.iter() {
-      let mut jrow: BTreeMap<String, Json> = BTreeMap::new();
-      for column in 0 .. self.columns {
-        let name = self.fname (column)?;
-        let jval = if row.is_null (column) {
-          Json::Null
-        } else {
-          match self.ftype (column) {
-            20 | 21 | 23 => Json::I64 (row.col_str (column) ?. parse() ?),  // 20 - bigint, 21 - smallint, 23 - integer
-            25 | 1042 | 1043 => Json::String (from_utf8 (row.col (column)) ?.into()),  // 25 - text, 1042 - char, 1043 - varchar
-            700 | 701 => Json::F64 (row.col_str (column) ?. parse() ?),  // 700 - real, 701 - double precision
-            114 | 3802 => json::from_str (row.col_str (column) ?) ?,  // 114 - json, 3802 - jsonb
-            // TODO (types I use):
-            // 16 => Type::Bool,
-            // 1184 => Type::TimestampTZ,
-            // 1700 => Type::Numeric,
-            // 3614 => Type::Tsvector,
-            // 3926 => Type::Int8Range
-            oid if oid > 16000 => {
-              // OID that large belong to user-defined types.
-              // We support enums by stringifying all user types in case they are ASCII.
-              // (I wonder if we could use `#define ANYENUMOID 3500` somehow to better detect if the OID is enum).
-              let bytes = row.col (column);
-              if bytes.is_empty() {return Err (PgFutureErr::UnknownType (String::from (name), oid))}
-              for &ch in bytes.iter() {
-                if !is_alphabetic (ch) && !is_digit (ch) && ch != b'_' && ch != b'-' && ch != b'.' {
-                  return Err (PgFutureErr::UnknownType (String::from (name), oid))}}
-              Json::String (unsafe {from_utf8_unchecked (bytes)} .into())},
-            oid => return Err (PgFutureErr::UnknownType (String::from (name), oid))}};
-        jrow.insert (String::from (name), jval);}
-      jrows.push (Json::Object (jrow))}
+    for row in self.iter() {jrows.push (row.to_json()?)}
     Ok (Json::Array (jrows))}}
 
 impl Drop for PgResult {
@@ -261,9 +263,11 @@ struct PgFutureSync {
 struct PgFutureImpl {
   id: u64,
   op: PgOperation,
-  sync: Mutex<PgFutureSync>}
+  sync: Mutex<PgFutureSync>,
+  miscarried: Option<Box<PgFutureErr>>}
 
 /// The part of `PgFutureErr` that's used when the SQL fails.
+#[derive(Clone)]
 pub struct PgSqlErr {
   /// Pointer to the failed future, which we keep in order to print the SQL in `Debug`.
   imp: Arc<PgFutureImpl>,
@@ -280,11 +284,14 @@ pub struct PgSqlErr {
   pub message: String}
 
 /// Returned when the future fails. Might print the SQL in `Debug`.
+#[derive(Clone)]
 pub enum PgFutureErr {
   PoisonError,
+  SendError (String),
+  NixError (nix::Error),
   Utf8Error (Utf8Error),
   Sql (PgSqlErr),
-  Json (serde_json::Error),
+  Json (Arc<serde_json::Error>),
   Int (std::num::ParseIntError),
   Float (std::num::ParseFloatError),
   /// Happens when we don't know how to convert a value to JSON.
@@ -294,6 +301,8 @@ impl fmt::Debug for PgFutureErr {
   fn fmt (&self, ft: &mut fmt::Formatter) -> Result<(), fmt::Error> {
     match self {
       &PgFutureErr::PoisonError => ft.write_str ("PgFutureErr::PoisonError"),
+      &PgFutureErr::SendError (ref err) => write! (ft, "PgFutureErr::SendError ({})", err),
+      &PgFutureErr::NixError (ref err) => write! (ft, "PgFutureErr::NixError ({:?})", err),
       &PgFutureErr::Utf8Error (ref err) => write! (ft, "PgFutureErr::Utf8Error ({:?})", err),
       &PgFutureErr::Sql (ref se) => write! (ft, "PgFutureErr ({:?}, {}, {})", se.imp.op.query_pieces, se.sqlstate, se.message),
       &PgFutureErr::Json (ref err) => write! (ft, "PgFutureErr::Json ({:?})", err),
@@ -305,6 +314,8 @@ impl fmt::Display for PgFutureErr {
   fn fmt (&self, ft: &mut fmt::Formatter) -> Result<(), fmt::Error> {
     match self {
       &PgFutureErr::PoisonError => ft.write_str ("PgFutureErr::PoisonError"),
+      &PgFutureErr::SendError (ref err) => write! (ft, "PgFutureErr::SendError ({})", err),
+      &PgFutureErr::NixError (ref err) => write! (ft, "PgFutureErr::NixError ({})", err),
       &PgFutureErr::Utf8Error (ref err) => write! (ft, "PgFutureErr::Utf8Error ({})", err),
       &PgFutureErr::Sql (ref se) => ft.write_str (&se.message),
       &PgFutureErr::Json (ref err) => write! (ft, "PgFutureErr::Json ({})", err),
@@ -316,6 +327,8 @@ impl Error for PgFutureErr {
   fn description (&self) -> &str {
     match self {
       &PgFutureErr::PoisonError => "PgFutureErr::PoisonError",
+      &PgFutureErr::SendError (_) => "PgFutureErr::SendError",
+      &PgFutureErr::NixError (_) => "PgFutureErr::NixError",
       &PgFutureErr::Utf8Error (_) => "PgFutureErr::Utf8Error",
       &PgFutureErr::Sql (ref se) => &se.message[..],
       &PgFutureErr::Json (_) => "PgFutureErr::Json",
@@ -333,7 +346,7 @@ impl From<Utf8Error> for PgFutureErr {
 
 impl From<serde_json::Error> for PgFutureErr {
   fn from (err: serde_json::Error) -> PgFutureErr {
-    PgFutureErr::Json (err)}}
+    PgFutureErr::Json (Arc::new (err))}}
 
 impl From<std::num::ParseIntError> for PgFutureErr {
   fn from (err: std::num::ParseIntError) -> PgFutureErr {
@@ -342,6 +355,14 @@ impl From<std::num::ParseIntError> for PgFutureErr {
 impl From<std::num::ParseFloatError> for PgFutureErr {
   fn from (err: std::num::ParseFloatError) -> PgFutureErr {
     PgFutureErr::Float (err)}}
+
+impl<T> From<SendError<T>> for PgFutureErr {
+  fn from (err: SendError<T>) -> PgFutureErr {
+    PgFutureErr::SendError (format! ("{}", err))}}
+
+impl From<nix::Error> for PgFutureErr {
+  fn from (err: nix::Error) -> PgFutureErr {
+    PgFutureErr::NixError (err)}}
 
 /// Delayed SQL result.
 #[derive(Clone)]
@@ -354,16 +375,34 @@ impl PgFuture {
       op: op,
       sync: Mutex::new (PgFutureSync {
         results: Vec::new(),
-        task: None})}))}}
+        task: None}),
+      miscarried: None}))}
+
+  fn error (err: PgFutureErr) -> PgFuture {
+    PgFuture (Arc::new (PgFutureImpl {
+      id: 0,
+      op: PgOperation {
+        query_pieces: Vec::new(),
+        statements: 0,
+        scheduling: PgSchedulingMode::AnythingGoes},
+      sync: Mutex::new (PgFutureSync {
+        results: Vec::new(),
+        task: None}),
+      miscarried: Some (Box::new (err))}))}}
 
 impl fmt::Debug for PgFuture {
   fn fmt (&self, ft: &mut fmt::Formatter) -> Result<(), fmt::Error> {
-    write! (ft, "PgFuture ({}, {:?})", self.0.id, self.0.op)}}
+    if let Some (ref err) = self.0.miscarried {
+      write! (ft, "PgFuture ({:?})", err)
+    } else {
+      write! (ft, "PgFuture ({}, {:?})", self.0.id, self.0.op)}}}
 
 impl Future for PgFuture {
   type Item = Vec<PgResult>;
   type Error = PgFutureErr;
   fn poll (&mut self) -> Poll<Vec<PgResult>, PgFutureErr> {
+    if let Some (ref err) = self.0.miscarried {return Err (*err.clone())}
+
     let mut sync = self.0.sync.lock()?;
 
     if sync.results.is_empty() {
@@ -734,14 +773,15 @@ impl Cluster {
   ///   use pg_async::PgQueryPiece::{Static as S, Plain as P, Literal as L, Bytea as B};
   ///   cluster.execute (vec! [S ("SELECT * FROM foo WHERE bar = "), L (bar)]);
   /// ```
-  pub fn execute<I: IntoQueryPieces> (&self, sql: I) -> Result<PgFuture, String> {
+  pub fn execute<I: IntoQueryPieces> (&self, sql: I) -> PgFuture {
     self.command_num.compare_and_swap (u64::max_value(), 0, Ordering::Relaxed);  // Recycle the set of identifiers.
     let id = self.command_num.fetch_add (1, Ordering::Relaxed) + 1;
     let pg_future = PgFuture::new (id, sql.into_query_pieces());
 
-    try_s! (try_s! (self.tx.lock()) .send (Message::Execute (pg_future.clone())));
-    try_s! (nix::unistd::write (self.write_end, &[2]));
-    Ok (pg_future)}}
+    { let tx = match self.tx.lock() {Ok (k) => k, Err (err) => return PgFuture::error (err.into())};
+      if let Err (err) = tx.send (Message::Execute (pg_future.clone())) {return PgFuture::error (err.into())}; }
+    if let Err (err) = nix::unistd::write (self.write_end, &[2]) {panic! ("!write on write_end: {}", err)};
+    pg_future}}
 
 impl Drop for Cluster {
   fn drop (&mut self) {
