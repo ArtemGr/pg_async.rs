@@ -11,6 +11,7 @@ extern crate itertools;
 #[cfg(test)] #[macro_use] extern crate lazy_static;
 extern crate libc;
 extern crate nix;
+extern crate serde;
 extern crate serde_json;
 
 use futures::{Future, Poll, Async};
@@ -18,6 +19,7 @@ use futures::task::{park, Task};
 use libc::{c_char, c_int, c_void, size_t};
 use nix::poll::{self, EventFlags, PollFd};
 use nix::fcntl::{O_NONBLOCK, O_CLOEXEC};
+use serde::Deserialize;
 use serde_json::{self as json, Value as Json};
 use std::collections::{BTreeMap, VecDeque};
 use std::convert::From;
@@ -234,7 +236,22 @@ impl PgResult {
   pub fn to_json (&self) -> Result<Json, PgFutureErr> {
     let mut jrows: Vec<Json> = Vec::with_capacity (self.len() as usize);
     for row in self.iter() {jrows.push (row.to_json()?)}
-    Ok (Json::Array (jrows))}}
+    Ok (Json::Array (jrows))}
+
+  /// Auto-unpack results.
+  ///
+  /// ```
+  /// #[derive(Deserialize)] struct Bar {id: i64}
+  /// impl Bar {
+  ///   fn load() -> Box<Future<Item=Vec<Bar>, Error=PgFutureErr>> {
+  ///     Box::new (PGA.execute ("SELECT id FROM bars") .and_then (|pr| pr[0].deserialize()))
+  ///   }
+  /// }
+  /// ```
+  pub fn deserialize<T: Deserialize> (&self) -> Result<Vec<T>, PgFutureErr> {
+    let mut jrows: Vec<T> = Vec::with_capacity (self.len() as usize);
+    for row in self.iter() {jrows.push (json::from_value (row.to_json()?) ?)}
+    Ok (jrows)}}
 
 impl Drop for PgResult {
   fn drop (&mut self) {
@@ -460,6 +477,8 @@ const PIPELINE_LIM_BYTES: usize = 16384;
 
 // To reconnect or to panic, that is the question...
 fn reconnect_heuristic (err: &str) -> bool {
+  // TODO: We should *probably* reconnect by default but then we should *at least* log the error.
+  //       So the plan is: 1) implement logging, 2) reconnect by default, 3) mark basic HA as implemented.
   err.starts_with ("server closed the connection unexpectedly") ||
   err.starts_with ("SSL SYSCALL error")}
 
@@ -694,6 +713,7 @@ fn event_loop (rx: Receiver<Message>, read_end: c_int) {
             if after_future {
               // Need to call `PQgetResult` one last time in order to flip a flag in libpq. Otherwise `PQsendQuery` won't work.
               let res = unsafe {pq::PQgetResult (conn.handle)};
+              // TODO: Handle PostgreSQL restarts. Test with "icecat --select-attributes".
               if res != null_mut() {panic! ("Unexpected result after an error")}
 
               // We're using BEGIN-COMMIT, so we should ROLLBACK after a failure.

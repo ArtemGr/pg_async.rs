@@ -3,8 +3,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](http://keepachangelog.com/) and this project adheres to [Semantic Versioning](http://semver.org/).
 
+### [0.4.1] - 2017-02-01
+`+` Implemented `PgResult::deserialize`, conveniently unpack query results into a Serde struct.
+
 ### [0.4.0] - 2017-01-30
-`+` Simplify the client side of `fn execute` error handling by lifting the errors into the future.
+`+` Simplify the client side of `fn execute` error handling by lifting the errors into the future.  
+`+` JSON serialization for a single row.
 
 ### [0.3.7] - 2017-01-24
 `+` Automatically reconnect after an "SSL SYSCALL error".
