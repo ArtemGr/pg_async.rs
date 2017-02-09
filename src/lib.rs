@@ -159,7 +159,7 @@ impl<'a> PgRow<'a> {
         pq::PQfreemem (bytes as *mut c_void);}}
     vec}
 
-  /// Convers the row into JSON, {$name: $value, ...}.
+  /// Converts the row into JSON, {$name: $value, ...}.
   pub fn to_json (&self) -> Result<Json, PgFutureErr> {
     let mut jrow: BTreeMap<String, Json> = BTreeMap::new();
     for column in 0 .. self.0.columns {
@@ -168,12 +168,12 @@ impl<'a> PgRow<'a> {
         Json::Null
       } else {
         match self.ftype (column) {
+          16 => Json::Bool (self.col (column) == b"t"),  // 16 boolean
           20 | 21 | 23 => Json::I64 (self.col_str (column) ?. parse() ?),  // 20 bigint, 21 smallint, 23 integer
           25 | 1042 | 1043 | 3614 => Json::String (from_utf8 (self.col (column)) ?.into()),  // 25 text, 1042 char, 1043 varchar, 3614 tsvector
           700 | 701 => Json::F64 (self.col_str (column) ?. parse() ?),  // 700 real, 701 double precision
           114 | 3802 => json::from_str (self.col_str (column) ?) ?,  // 114 json, 3802 jsonb
           // TODO (types I use):
-          // 16 => Type::Bool,
           // 1184 => Type::TimestampTZ,
           // 1700 => Type::Numeric,
           // 3926 => Type::Int8Range
@@ -232,7 +232,7 @@ impl PgResult {
   pub fn iter<'a> (&'a self) -> PgResultIt<'a> {
     PgResultIt {pr: self, row: 0}}
 
-  /// Convers a PostgreSQL query result into a JSON array of rows, [{$name: $value, ...}, ...].
+  /// Converts a PostgreSQL query result into a JSON array of rows, [{$name: $value, ...}, ...].
   pub fn to_json (&self) -> Result<Json, PgFutureErr> {
     let mut jrows: Vec<Json> = Vec::with_capacity (self.len() as usize);
     for row in self.iter() {jrows.push (row.to_json()?)}
