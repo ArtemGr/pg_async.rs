@@ -159,35 +159,42 @@ impl<'a> PgRow<'a> {
         pq::PQfreemem (bytes as *mut c_void);}}
     vec}
 
+  /// Converts the column into JSON.
+  ///
+  /// * `column` - The number of the column which value is to be converted to JSON. 0-based.
+  /// * `name` - The name of the column. To make the errors more verbose if they'd happen.
+  pub fn col_json (&self, column: u32, name: &str) -> Result<Json, PgFutureErr> {
+    Ok (if self.is_null (column) {
+      Json::Null
+    } else {
+      match self.ftype (column) {
+        16 => Json::Bool (self.col (column) == b"t"),  // 16 boolean
+        20 | 21 | 23 => Json::I64 (self.col_str (column) ?. parse() ?),  // 20 bigint, 21 smallint, 23 integer
+        25 | 1042 | 1043 | 3614 => Json::String (from_utf8 (self.col (column)) ?.into()),  // 25 text, 1042 char, 1043 varchar, 3614 tsvector
+        700 | 701 => Json::F64 (self.col_str (column) ?. parse() ?),  // 700 real, 701 double precision
+        114 | 3802 => json::from_str (self.col_str (column) ?) ?,  // 114 json, 3802 jsonb
+        // TODO (types I use):
+        // 1184 => Type::TimestampTZ,
+        // 1700 => Type::Numeric,
+        // 3926 => Type::Int8Range
+        oid if oid > 16000 => {
+          // OID that large belong to user-defined types.
+          // We support enums by stringifying all user types in case they are ASCII.
+          // (I wonder if we could use `#define ANYENUMOID 3500` somehow to better detect if the OID is enum).
+          let bytes = self.col (column);
+          if bytes.is_empty() {return Err (PgFutureErr::UnknownType (String::from (name), oid))}
+          for &ch in bytes.iter() {
+            if !is_alphabetic (ch) && !is_digit (ch) && ch != b'_' && ch != b'-' && ch != b'.' {
+              return Err (PgFutureErr::UnknownType (String::from (name), oid))}}
+          Json::String (unsafe {from_utf8_unchecked (bytes)} .into())},
+        oid => return Err (PgFutureErr::UnknownType (String::from (name), oid))}})}
+
   /// Converts the row into JSON, {$name: $value, ...}.
   pub fn to_json (&self) -> Result<Json, PgFutureErr> {
     let mut jrow: BTreeMap<String, Json> = BTreeMap::new();
     for column in 0 .. self.0.columns {
-      let name = self.fname (column)?;
-      let jval = if self.is_null (column) {
-        Json::Null
-      } else {
-        match self.ftype (column) {
-          16 => Json::Bool (self.col (column) == b"t"),  // 16 boolean
-          20 | 21 | 23 => Json::I64 (self.col_str (column) ?. parse() ?),  // 20 bigint, 21 smallint, 23 integer
-          25 | 1042 | 1043 | 3614 => Json::String (from_utf8 (self.col (column)) ?.into()),  // 25 text, 1042 char, 1043 varchar, 3614 tsvector
-          700 | 701 => Json::F64 (self.col_str (column) ?. parse() ?),  // 700 real, 701 double precision
-          114 | 3802 => json::from_str (self.col_str (column) ?) ?,  // 114 json, 3802 jsonb
-          // TODO (types I use):
-          // 1184 => Type::TimestampTZ,
-          // 1700 => Type::Numeric,
-          // 3926 => Type::Int8Range
-          oid if oid > 16000 => {
-            // OID that large belong to user-defined types.
-            // We support enums by stringifying all user types in case they are ASCII.
-            // (I wonder if we could use `#define ANYENUMOID 3500` somehow to better detect if the OID is enum).
-            let bytes = self.col (column);
-            if bytes.is_empty() {return Err (PgFutureErr::UnknownType (String::from (name), oid))}
-            for &ch in bytes.iter() {
-              if !is_alphabetic (ch) && !is_digit (ch) && ch != b'_' && ch != b'-' && ch != b'.' {
-                return Err (PgFutureErr::UnknownType (String::from (name), oid))}}
-            Json::String (unsafe {from_utf8_unchecked (bytes)} .into())},
-          oid => return Err (PgFutureErr::UnknownType (String::from (name), oid))}};
+      let name = self.fname (column) ?;
+      let jval = self.col_json (column, name) ?;
       jrow.insert (String::from (name), jval);}
     Ok (Json::Object (jrow))}}
 
