@@ -7,6 +7,7 @@
 
 extern crate futures;
 #[macro_use] extern crate gstuff;
+extern crate inlinable_string;
 extern crate itertools;
 #[cfg(test)] #[macro_use] extern crate lazy_static;
 extern crate libc;
@@ -16,6 +17,7 @@ extern crate serde_json;
 
 use futures::{Future, Poll, Async};
 use futures::task::{park, Task};
+use inlinable_string::InlinableString;
 use libc::{c_char, c_int, c_void, size_t};
 use nix::poll::{self, EventFlags, PollFd};
 use nix::fcntl::{O_NONBLOCK, O_CLOEXEC};
@@ -53,6 +55,10 @@ pub enum PgQueryPiece {
   Plain (String),
   /// Literals are escaped with `PQescapeLiteral` (which also places them into the single quotes).
   Literal (String),
+  /// Literals are escaped with `PQescapeLiteral` (which also places them into the single quotes).
+  ///
+  /// InlinableLiteral allows for small string optimization.
+  InlinableLiteral (InlinableString),
   /// Binary data, escaped with `PQescapeByteaConn`. Single quotes aren't added by the escape.
   Bytea (Vec<u8>)}
 
@@ -540,7 +546,7 @@ fn event_loop (rx: Receiver<Message>, read_end: c_int) {
       if status == pq::CONNECTION_BAD {
         // TODO: Log the failed connection attempt.
         // TODO: An option not to retry too fast?
-        unsafe {pq::PQreset (conn.handle)};  // Keep trying.
+        unsafe {pq::PQresetStart (conn.handle)};  // Keep trying.
       } else if status == pq::CONNECTION_OK {
         let rc = unsafe {pq::PQsetnonblocking (conn.handle, 1)};
         if rc != 0 {panic! ("!PQsetnonblocking: {}", error_message (conn.handle))}
@@ -594,6 +600,11 @@ fn event_loop (rx: Receiver<Message>, read_end: c_int) {
               if esc == null_mut() {panic! ("!PQescapeLiteral: {}", error_message (conn.handle))}
               sql.push_str (unsafe {CStr::from_ptr (esc)} .to_str().expect ("!esc"));
               unsafe {pq::PQfreemem (esc as *mut c_void)};},
+            &PgQueryPiece::InlinableLiteral (ref literal) => {
+              let esc = unsafe {pq::PQescapeLiteral (conn.handle, literal.as_ptr() as *const c_char, literal.len())};
+              if esc == null_mut() {panic! ("!PQescapeLiteral: {}", error_message (conn.handle))}
+              sql.push_str (unsafe {CStr::from_ptr (esc)} .to_str().expect ("!esc"));
+              unsafe {pq::PQfreemem (esc as *mut c_void)};},
             &PgQueryPiece::Bytea (ref bytes) => {
               let mut escaped_size: size_t = 0;
               let esc = unsafe {pq::PQescapeByteaConn (conn.handle, bytes.as_ptr(), bytes.len(), &mut escaped_size)};
@@ -617,7 +628,7 @@ fn event_loop (rx: Receiver<Message>, read_end: c_int) {
         if reconnect_heuristic (&err) {
           // Experimental reconnection support.
           // TODO: Log the reconnection.
-          unsafe {pq::PQreset (conn.handle)};
+          unsafe {pq::PQresetStart (conn.handle)};
           conn.connection_pending = true;
           for future in sql_futures.drain (..) {reschedule! (conn, future)}
           continue}
@@ -678,7 +689,7 @@ fn event_loop (rx: Receiver<Message>, read_end: c_int) {
                 if sqlstate == "57P01" {
                   // Experimental reconnection support.
                   // TODO: Log the reconnection.
-                  unsafe {pq::PQreset (conn.handle)};
+                  unsafe {pq::PQresetStart (conn.handle)};
                   conn.connection_pending = true;
                   reschedule! (conn, pg_future);
                   for future in conn.in_flight.drain (..) {reschedule! (conn, future)}
@@ -880,7 +891,9 @@ pub mod pq {  // cf. "bindgen /usr/include/postgresql/libpq-fe.h".
     /// https://www.postgresql.org/docs/9.4/static/libpq-status.html#LIBPQ-PQSTATUS
     pub fn PQstatus (conn: *const PGconn) -> ConnStatusType;
     /// https://www.postgresql.org/docs/9.4/static/libpq-connect.html#LIBPQ-PQRESET
-    pub fn PQreset (conn: *const PGconn);
+    pub fn PQreset (conn: *mut PGconn);
+    /// https://www.postgresql.org/docs/9.4/static/libpq-connect.html#LIBPQ-PQRESETSTART
+    pub fn PQresetStart (conn: *mut PGconn) -> c_int;
     /// https://www.postgresql.org/docs/9.4/static/libpq-connect.html#LIBPQ-PQCONNECTSTARTPARAMS
     pub fn PQconnectPoll (conn: *mut PGconn) -> PostgresPollingStatusType;
     /// https://www.postgresql.org/docs/9.4/static/libpq-status.html#LIBPQ-PQSOCKET
