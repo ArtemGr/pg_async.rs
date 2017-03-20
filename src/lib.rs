@@ -3,7 +3,7 @@
 // NB: There is a work in progress on a better pipelining support in libpq: https://commitfest.postgresql.org/10/634/
 //     http://2ndquadrant.github.io/postgres/libpq-batch-mode.html
 
-#![feature(type_ascription, integer_atomics)]
+#![feature(type_ascription, integer_atomics, custom_derive)]
 
 extern crate futures;
 #[macro_use] extern crate gstuff;
@@ -13,6 +13,7 @@ extern crate itertools;
 extern crate libc;
 extern crate nix;
 extern crate serde;
+#[macro_use] extern crate serde_derive;
 extern crate serde_json;
 
 use futures::{Future, Poll, Async};
@@ -175,6 +176,10 @@ impl<'a> PgRow<'a> {
     } else {
       match self.ftype (column) {
         16 => Json::Bool (self.col (column) == b"t"),  // 16 boolean
+        18 => {  // 18 "char"
+          // Funny thing is, libpq "eats" the zero character, turns it into an empty string.
+          let slice = self.col (column);
+          Json::U64 (if slice.is_empty() {0} else {slice[0] as u64})},
         20 | 21 | 23 => Json::I64 (self.col_str (column) ?. parse() ?),  // 20 bigint, 21 smallint, 23 integer
         25 | 1042 | 1043 | 3614 => Json::String (from_utf8 (self.col (column)) ?.into()),  // 25 text, 1042 char, 1043 varchar, 3614 tsvector
         700 | 701 => Json::F64 (self.col_str (column) ?. parse() ?),  // 700 real, 701 double precision

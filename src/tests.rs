@@ -91,3 +91,15 @@ fn check_sync<T: Sync>(_: &T) {}
   for op in ops {
     let rows = op.wait().unwrap().remove (6);  // SELECT is the 6th statement.
     assert_eq! (rows.row (0) .col (0), b"4");}}
+
+#[test] fn u8_char_to_json() {
+  let cluster = Cluster::new() .expect ("!Cluster");
+  for dsn in DSNS.iter() {cluster.connect (dsn.clone(), 1) .expect ("!connect")}
+  #[derive(Deserialize)] struct Row {zero: u8, one: u8, a: u8, bom: u8}
+  let pr = cluster.execute (
+    "SELECT 0::\"char\" AS zero, 1::\"char\" AS one, 'a'::\"char\" AS a, E'\\xEF\\xBB\\xBF'::\"char\" AS bom") .wait().unwrap();
+  let row: Row = json::from_value (pr[0].row (0) .to_json().unwrap()) .unwrap();
+  assert_eq! (row.zero, 0);
+  assert_eq! (row.one, 1);
+  assert_eq! (row.a, b'a');
+  assert_eq! (row.bom, 0xEF);}

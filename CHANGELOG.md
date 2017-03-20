@@ -3,6 +3,9 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](http://keepachangelog.com/) and this project adheres to [Semantic Versioning](http://semver.org/).
 
+### [0.4.5] - 2017-03-20
+`+` Support deserializing u8 "char" type (oid 18).
+
 ### [0.4.4] - 2017-03-14
 `!` Fixed to use the `PQresetStart` instead of the blocking `PQreset`.  
 `+` Support InlinableString literals in order not to heap so much.
