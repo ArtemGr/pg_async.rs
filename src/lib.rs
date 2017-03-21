@@ -13,7 +13,7 @@ extern crate itertools;
 extern crate libc;
 extern crate nix;
 extern crate serde;
-#[macro_use] extern crate serde_derive;
+#[cfg(test)] #[macro_use] extern crate serde_derive;
 extern crate serde_json;
 
 use futures::{Future, Poll, Async};
@@ -24,7 +24,7 @@ use nix::poll::{self, EventFlags, PollFd};
 use nix::fcntl::{O_NONBLOCK, O_CLOEXEC};
 use serde::Deserialize;
 use serde_json::{self as json, Value as Json};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::VecDeque;
 use std::convert::From;
 use std::error::Error;
 use std::ffi::{CString, CStr};
@@ -58,8 +58,8 @@ pub enum PgQueryPiece {
   Literal (String),
   /// Literals are escaped with `PQescapeLiteral` (which also places them into the single quotes).
   ///
-  /// InlinableLiteral allows for small string optimization.
-  InlinableLiteral (InlinableString),
+  /// InlLiteral allows for small string optimization.
+  InlLiteral (InlinableString),
   /// Binary data, escaped with `PQescapeByteaConn`. Single quotes aren't added by the escape.
   Bytea (Vec<u8>)}
 
@@ -179,11 +179,13 @@ impl<'a> PgRow<'a> {
         18 => {  // 18 "char"
           // Funny thing is, libpq "eats" the zero character, turns it into an empty string.
           let slice = self.col (column);
-          Json::U64 (if slice.is_empty() {0} else {slice[0] as u64})},
-        20 | 21 | 23 => Json::I64 (self.col_str (column) ?. parse() ?),  // 20 bigint, 21 smallint, 23 integer
+          Json::Number ((if slice.is_empty() {0} else {slice[0]}) .into())},
+        20 | 21 | 23 => Json::Number ((self.col_str (column) ?.parse()? :i64).into()),  // 20 bigint, 21 smallint, 23 integer
         25 | 1042 | 1043 | 3614 => Json::String (from_utf8 (self.col (column)) ?.into()),  // 25 text, 1042 char, 1043 varchar, 3614 tsvector
-        700 | 701 => Json::F64 (self.col_str (column) ?. parse() ?),  // 700 real, 701 double precision
-        114 | 3802 => json::from_str (self.col_str (column) ?) ?,  // 114 json, 3802 jsonb
+        700 | 701 => {  // 700 real, 701 double precision
+          let f: f64 = self.col_str (column) ?.parse()?;
+          Json::Number (json::Number::from_f64 (f) .ok_or ("The float is not a JSON number") ?)},
+        114 | 3802 => json::from_slice (self.col (column)) ?,  // 114 json, 3802 jsonb
         // TODO (types I use):
         // 1184 => Type::TimestampTZ,
         // 1700 => Type::Numeric,
@@ -200,9 +202,19 @@ impl<'a> PgRow<'a> {
           Json::String (unsafe {from_utf8_unchecked (bytes)} .into())},
         oid => return Err (PgFutureErr::UnknownType (String::from (name), oid))}})}
 
+  /// Auto-unpack the column value.
+  pub fn col_deserialize<T: Deserialize> (&self, column: u32, name: &str) -> Result<T, PgFutureErr> {
+    if !self.is_null (column) {
+      match self.ftype (column) {
+        114 | 3802 =>  // 114 json, 3802 jsonb
+          return Ok (json::from_slice (self.col (column)) ?),  // Shortcut to `from_slice`, avoiding intermediate Json representation.
+        _ => ()}}
+
+    Ok (json::from_value (self.col_json (column, name) ?) ?)}
+
   /// Converts the row into JSON, {$name: $value, ...}.
   pub fn to_json (&self) -> Result<Json, PgFutureErr> {
-    let mut jrow: BTreeMap<String, Json> = BTreeMap::new();
+    let mut jrow: json::Map<String, Json> = json::Map::new();
     for column in 0 .. self.0.columns {
       let name = self.fname (column) ?;
       let jval = self.col_json (column, name) ?;
@@ -330,7 +342,8 @@ pub enum PgFutureErr {
   Int (std::num::ParseIntError),
   Float (std::num::ParseFloatError),
   /// Happens when we don't know how to convert a value to JSON.
-  UnknownType (String, pq::Oid)}
+  UnknownType (String, pq::Oid),
+  Str (&'static str)}
 
 impl fmt::Debug for PgFutureErr {
   fn fmt (&self, ft: &mut fmt::Formatter) -> Result<(), fmt::Error> {
@@ -343,7 +356,8 @@ impl fmt::Debug for PgFutureErr {
       &PgFutureErr::Json (ref err) => write! (ft, "PgFutureErr::Json ({:?})", err),
       &PgFutureErr::Int (ref err) => write! (ft, "PgFutureErr::Int ({:?})", err),
       &PgFutureErr::Float (ref err) => write! (ft, "PgFutureErr::Float ({:?})", err),
-      &PgFutureErr::UnknownType (ref fname, oid) => write! (ft, "PgFutureErr::UnknownType (fname '{}', oid {})", fname, oid)}}}
+      &PgFutureErr::UnknownType (ref fname, oid) => write! (ft, "PgFutureErr::UnknownType (fname '{}', oid {})", fname, oid),
+      &PgFutureErr::Str (s) => ft.write_str (s)}}}
 
 impl fmt::Display for PgFutureErr {
   fn fmt (&self, ft: &mut fmt::Formatter) -> Result<(), fmt::Error> {
@@ -356,7 +370,8 @@ impl fmt::Display for PgFutureErr {
       &PgFutureErr::Json (ref err) => write! (ft, "PgFutureErr::Json ({})", err),
       &PgFutureErr::Int (ref err) => write! (ft, "PgFutureErr::Int ({})", err),
       &PgFutureErr::Float (ref err) => write! (ft, "PgFutureErr::Float ({})", err),
-      &PgFutureErr::UnknownType (ref fname, oid) => write! (ft, "Column '{}' has unfamiliar OID {}", fname, oid)}}}
+      &PgFutureErr::UnknownType (ref fname, oid) => write! (ft, "Column '{}' has unfamiliar OID {}", fname, oid),
+      &PgFutureErr::Str (s) => ft.write_str (s)}}}
 
 impl Error for PgFutureErr {
   fn description (&self) -> &str {
@@ -369,7 +384,8 @@ impl Error for PgFutureErr {
       &PgFutureErr::Json (_) => "PgFutureErr::Json",
       &PgFutureErr::Int (_) => "PgFutureErr::Int",
       &PgFutureErr::Float (_) => "PgFutureErr::Float",
-      &PgFutureErr::UnknownType (..) => "PgFutureErr::UnknownType"}}}
+      &PgFutureErr::UnknownType (..) => "PgFutureErr::UnknownType",
+      &PgFutureErr::Str (s) => s}}}
 
 impl<T> From<PoisonError<T>> for PgFutureErr {
   fn from (_err: PoisonError<T>) -> PgFutureErr {
@@ -398,6 +414,10 @@ impl<T> From<SendError<T>> for PgFutureErr {
 impl From<nix::Error> for PgFutureErr {
   fn from (err: nix::Error) -> PgFutureErr {
     PgFutureErr::NixError (err)}}
+
+impl From<&'static str> for PgFutureErr {
+  fn from (err: &'static str) -> PgFutureErr {
+    PgFutureErr::Str (err)}}
 
 /// Delayed SQL result.
 #[derive(Clone)]
@@ -605,7 +625,7 @@ fn event_loop (rx: Receiver<Message>, read_end: c_int) {
               if esc == null_mut() {panic! ("!PQescapeLiteral: {}", error_message (conn.handle))}
               sql.push_str (unsafe {CStr::from_ptr (esc)} .to_str().expect ("!esc"));
               unsafe {pq::PQfreemem (esc as *mut c_void)};},
-            &PgQueryPiece::InlinableLiteral (ref literal) => {
+            &PgQueryPiece::InlLiteral (ref literal) => {
               let esc = unsafe {pq::PQescapeLiteral (conn.handle, literal.as_ptr() as *const c_char, literal.len())};
               if esc == null_mut() {panic! ("!PQescapeLiteral: {}", error_message (conn.handle))}
               sql.push_str (unsafe {CStr::from_ptr (esc)} .to_str().expect ("!esc"));

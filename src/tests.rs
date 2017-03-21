@@ -19,7 +19,7 @@ lazy_static! {
 
   for (expect, pr) in results {
     let pr: PgResult = pr.wait().expect ("!pr") .remove (0);
-    assert_eq! (expect, pr.row (0) .col_str (0) .unwrap().parse().unwrap());}}
+    assert_eq! (expect, pr.row (0) .col_str (0) .unwrap().parse().unwrap() :u8);}}
 
 fn check_send<T: Send>(_: &T) {}
 fn check_sync<T: Sync>(_: &T) {}
