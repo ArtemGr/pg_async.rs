@@ -516,7 +516,7 @@ const PIPELINE_LIM_BYTES: usize = 16384;
 // To reconnect or to panic, that is the question...
 fn reconnect_heuristic (err: &str) -> bool {
   // TODO: We should *probably* reconnect by default but then we should *at least* log the error.
-  //       So the plan is: 1) implement logging, 2) reconnect by default, 3) mark basic HA as implemented.
+  //       So the plan is: 1) implement logging (crates.io/crates/log), 2) reconnect by default, 3) mark basic HA as implemented.
   err.starts_with ("server closed the connection unexpectedly") ||
   err.starts_with ("SSL SYSCALL error")}
 
@@ -776,6 +776,14 @@ fn event_loop (rx: Receiver<Message>, read_end: c_int) {
 
   for conn in connections {unsafe {pq::PQfinish (conn.handle)}}}
 
+// Wakes up the event loop by writing into the pipe.
+fn wake_up (write_end: c_int, payload: u8) -> Result<(), String> {
+  if let Err (err) = nix::unistd::write (write_end, &[payload]) {
+    match err {
+      nix::Error::Sys (errno) if errno == nix::Errno::EAGAIN => (),  // So the pipe can overflow when there's a lot of wake up calls.
+      _ => return ERR! ("!write on write_end: {}", err)}}
+  Ok(())}
+
 /// A cluster of several replicated PostgreSQL nodes.
 pub struct Cluster {
   /// Runs the event loop.
@@ -810,7 +818,7 @@ impl Cluster {
   ///           but parallelism can be increased by adding the same connection several times.
   pub fn connect (&self, dsn: String, mul: u8) -> Result<(), String> {
     try_s! (try_s! (self.tx.lock()) .send (Message::Connect (dsn, mul)));
-    try_s! (nix::unistd::write (self.write_end, &[1]));
+    try_s! (wake_up (self.write_end, 1));
     Ok(())}
 
   /// Schedule an SQL command to be executed on one of the nodes.
@@ -843,14 +851,14 @@ impl Cluster {
 
     { let tx = match self.tx.lock() {Ok (k) => k, Err (err) => return PgFuture::error (err.into())};
       if let Err (err) = tx.send (Message::Execute (pg_future.clone())) {return PgFuture::error (err.into())}; }
-    if let Err (err) = nix::unistd::write (self.write_end, &[2]) {panic! ("!write on write_end: {}", err)};
+    if let Err (err) = wake_up (self.write_end, 2) {panic! ("{}", err)}
     pg_future}}
 
 impl Drop for Cluster {
   fn drop (&mut self) {
     if let Ok (tx) = self.tx.lock() {
       let _ = tx.send (Message::Drop);}
-    let _ = nix::unistd::write (self.write_end, &[3]);
+    let _ = wake_up (self.write_end, 3);
     let mut thread = None;
     std::mem::swap (&mut thread, &mut self.thread);
     if let Some (thread) = thread {let _ = thread.join();}}}

@@ -3,10 +3,13 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](http://keepachangelog.com/) and this project adheres to [Semantic Versioning](http://semver.org/).
 
+### [0.5.1] - 2017-03-30
+`!` Ignore the wake-up pipe overflows.
+
 ### [0.5.0] - 2017-03-21
 `*` Serde 0.8 -> 0.9.  
-`*` InlinableString -> InlLiteral.
-`+` `PgRow::col_deserialize`, unpacks a single column value.
+`*` InlinableString -> InlLiteral.  
+`+` `PgRow::col_deserialize` unpacks a single column value.
 
 ### [0.4.5] - 2017-03-20
 `+` Support deserializing u8 "char" type (oid 18).

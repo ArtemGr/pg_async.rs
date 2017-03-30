@@ -1,6 +1,6 @@
 [package]
 name = "pg_async"
-version = "0.5.0"
+version = "0.5.1"
 authors = ["Artem <artemciy@gmail.com>"]
 links = "pq"
 build = "build.rs"
@@ -20,7 +20,7 @@ doctest = false
 
 [dependencies]
 futures = "0.1"
-gstuff = "0.3"
+gstuff = "0.4"
 inlinable_string = "0.1"
 itertools = "0.5"
 lazy_static = "0.2"
