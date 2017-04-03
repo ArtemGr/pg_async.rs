@@ -174,7 +174,7 @@ impl<'a> PgRow<'a> {
     Ok (if self.is_null (column) {
       Json::Null
     } else {
-      match self.ftype (column) {
+      match self.ftype (column) {  // cf. "/usr/include/postgresql/9.*/server/catalog/pg_type.h"
         16 => Json::Bool (self.col (column) == b"t"),  // 16 boolean
         18 => {  // 18 "char"
           // Funny thing is, libpq "eats" the zero character, turns it into an empty string.
@@ -182,10 +182,11 @@ impl<'a> PgRow<'a> {
           Json::Number ((if slice.is_empty() {0} else {slice[0]}) .into())},
         20 | 21 | 23 => Json::Number ((self.col_str (column) ?.parse()? :i64).into()),  // 20 bigint, 21 smallint, 23 integer
         25 | 1042 | 1043 | 3614 => Json::String (from_utf8 (self.col (column)) ?.into()),  // 25 text, 1042 char, 1043 varchar, 3614 tsvector
+        114 | 3802 => json::from_slice (self.col (column)) ?,  // 114 json, 3802 jsonb
         700 | 701 => {  // 700 real, 701 double precision
           let f: f64 = self.col_str (column) ?.parse()?;
           Json::Number (json::Number::from_f64 (f) .ok_or ("The float is not a JSON number") ?)},
-        114 | 3802 => json::from_slice (self.col (column)) ?,  // 114 json, 3802 jsonb
+        705 => Json::String (from_utf8 (self.col (column)) ?.into()),  // 705 unknown. SELECT 'foo'.
         // TODO (types I use):
         // 1184 => Type::TimestampTZ,
         // 1700 => Type::Numeric,
