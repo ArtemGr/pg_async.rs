@@ -72,18 +72,38 @@ pub enum PgSchedulingMode {
   /// If the connection is not available (the server is down or inaccessible) then the operation might stay in the queue forever.
   PinToConnection (u8)}
 
+impl Default for PgSchedulingMode {
+  fn default() -> PgSchedulingMode {
+    PgSchedulingMode::AnythingGoes}}
+
 /// An atomic operation that is to be asynchronously executed.
-#[derive (Debug)]
+#[derive (Default)]
 pub struct PgOperation {
   /// Parts of SQL text, some of which are to be escaped and some are not.
   ///
   /// Might contain several SQL statements (the number of statements MUST match the number in the `statements` field).
   pub query_pieces: Vec<PgQueryPiece>,
+
   /// The number of separate top-level SQL statements withing `query_pieces`.  
   /// E.g. the number of results PostgreSQL will return.
   pub statements: u32,
+
   /// Affects the placement of the operation.
-  pub scheduling: PgSchedulingMode}
+  pub scheduling: PgSchedulingMode,
+
+  /// Callback which fires when the SQL is escaped.  
+  /// Useful for debugging. Escaped SQL can be copy-pasted "as is" into a third-party SQL client.
+  ///
+  ///         let query = vec! [S ("UPDATE foo SET bar = "), L (user_input)];
+  ///         let mut op: PgOperation = query.into_query_pieces();
+  ///         if debug {op.on_escape = Some (Box::new (|sql| log! ("escaped query: {}", sql)))}
+  ///         let f = cluster.execute (op);
+  pub on_escape: Option<Box<Fn(&str) + Send + Sync + 'static>>}
+
+impl fmt::Debug for PgOperation {
+  fn fmt (&self, fm: &mut fmt::Formatter) -> fmt::Result {
+    write! (fm, "PgOperation {{query_pieces: {:?}, statements: {}, scheduling: {:?}, on_escape: {}}}",
+      self.query_pieces, self.statements, self.scheduling, if self.on_escape.is_some() {"Some"} else {"None"})}}
 
 /// Converts the `fn execute` input into a vector of query pieces.
 pub trait IntoQueryPieces {
@@ -92,27 +112,27 @@ pub trait IntoQueryPieces {
 
 impl IntoQueryPieces for String {
   fn into_query_pieces (self) -> PgOperation {
-    PgOperation {statements: 1, query_pieces: vec! [PgQueryPiece::Plain (self)], scheduling: PgSchedulingMode::AnythingGoes}}}
+    PgOperation {statements: 1, query_pieces: vec! [PgQueryPiece::Plain (self)], scheduling: PgSchedulingMode::AnythingGoes, on_escape: None}}}
 
 impl IntoQueryPieces for &'static str {
   fn into_query_pieces (self) -> PgOperation {
-    PgOperation {statements: 1, query_pieces: vec! [PgQueryPiece::Static (self)], scheduling: PgSchedulingMode::AnythingGoes}}}
+    PgOperation {statements: 1, query_pieces: vec! [PgQueryPiece::Static (self)], scheduling: PgSchedulingMode::AnythingGoes, on_escape: None}}}
 
 impl IntoQueryPieces for Vec<PgQueryPiece> {
   fn into_query_pieces (self) -> PgOperation {
-    PgOperation {statements: 1, query_pieces: self, scheduling: PgSchedulingMode::AnythingGoes}}}
+    PgOperation {statements: 1, query_pieces: self, scheduling: PgSchedulingMode::AnythingGoes, on_escape: None}}}
 
 impl IntoQueryPieces for (u32, &'static str) {
   fn into_query_pieces (self) -> PgOperation {
-    PgOperation {statements: self.0, query_pieces: vec! [PgQueryPiece::Static (self.1)], scheduling: PgSchedulingMode::AnythingGoes}}}
+    PgOperation {statements: self.0, query_pieces: vec! [PgQueryPiece::Static (self.1)], scheduling: PgSchedulingMode::AnythingGoes, on_escape: None}}}
 
 impl IntoQueryPieces for (u32, String) {
   fn into_query_pieces (self) -> PgOperation {
-    PgOperation {statements: self.0, query_pieces: vec! [PgQueryPiece::Plain (self.1)], scheduling: PgSchedulingMode::AnythingGoes}}}
+    PgOperation {statements: self.0, query_pieces: vec! [PgQueryPiece::Plain (self.1)], scheduling: PgSchedulingMode::AnythingGoes, on_escape: None}}}
 
 impl IntoQueryPieces for (u32, Vec<PgQueryPiece>) {
   fn into_query_pieces (self) -> PgOperation {
-    PgOperation {statements: self.0, query_pieces: self.1, scheduling: PgSchedulingMode::AnythingGoes}}}
+    PgOperation {statements: self.0, query_pieces: self.1, scheduling: PgSchedulingMode::AnythingGoes, on_escape: None}}}
 
 impl IntoQueryPieces for PgOperation {
   fn into_query_pieces (self) -> PgOperation {self}}
@@ -440,7 +460,8 @@ impl PgFuture {
       op: PgOperation {
         query_pieces: Vec::new(),
         statements: 0,
-        scheduling: PgSchedulingMode::AnythingGoes},
+        scheduling: PgSchedulingMode::AnythingGoes,
+        on_escape: None},
       sync: Mutex::new (PgFutureSync {
         results: Vec::new(),
         task: None}),
@@ -617,6 +638,8 @@ fn event_loop (rx: Receiver<Message>, read_end: c_int) {
             None => break}};
         if first {first = false} else {sql.push_str ("; ")}
         write! (&mut sql, "BEGIN; SELECT {} AS future_id; ", pending.0.id) .expect ("!write");
+
+        let escape_start_len = sql.len();
         for piece in pending.0.op.query_pieces.iter() {
           match piece {
             &PgQueryPiece::Static (ref ss) => sql.push_str (ss),
@@ -639,6 +662,10 @@ fn event_loop (rx: Receiver<Message>, read_end: c_int) {
               let esc_slice = unsafe {from_raw_parts (esc, escaped_size - 1)};
               sql.push_str (unsafe {from_utf8_unchecked (esc_slice)});
               unsafe {pq::PQfreemem (esc as *mut c_void)};}}}
+
+        if let Some (ref on_escape) = pending.0.op.on_escape {
+          on_escape (&sql[escape_start_len..])}
+
         // Wrap every command in a separate transaction in order not to loose the DML changes when there is an erroneous statement in the pipeline.
         sql.push_str ("; COMMIT");
         sql_futures.push (pending)}

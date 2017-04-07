@@ -52,7 +52,8 @@ fn main() {
           cluster.execute (PgOperation {
             scheduling: PgSchedulingMode::PinToConnection (pin),
             statements: 1,
-            query_pieces: vec! [P (fomat! ("SELECT " (rid) " AS rid"))]
+            query_pieces: vec! [P (fomat! ("SELECT " (rid) " AS rid"))],
+            on_escape: None
           })}};
 
       let f: Box<Future<Item=(), Error=()> + Send> = {
