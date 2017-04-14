@@ -19,3 +19,7 @@ Asynchronous, HA (master-master) PostgreSQL driver on top of libpq.
 - [x] Pin mode: send the operation to one of the nodes only (useful to avoid some of the master-master conflicts).
 - [x] There is a JSON helper converting table rows to serde_json objects.
 - [ ] If the operation wasn't pipelined already, dropping a `Future` allows the driver to cancel it.
+
+## Notes
+
+The combination of libpq and OpenSSL doesn't work very well during PostgreSQL server restarts. I've seen libpq SEGV-crash reliably when the OpenSSL layer is enabled. For the driver to properly work around PostgreSQL server unavailability and restarts I recommend adding the "sslmode=disable" disabler to the connection strings.
