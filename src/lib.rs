@@ -22,7 +22,7 @@ use inlinable_string::InlinableString;
 use libc::{c_char, c_int, c_void, size_t};
 use nix::poll::{self, EventFlags, PollFd};
 use nix::fcntl::{O_NONBLOCK, O_CLOEXEC};
-use serde::Deserialize;
+use serde::de::DeserializeOwned;
 use serde_json::{self as json, Value as Json};
 use std::collections::VecDeque;
 use std::convert::From;
@@ -141,16 +141,22 @@ pub struct PgRow<'a> (&'a PgResult, u32);
 
 impl<'a> PgRow<'a> {
   /// True if the value is NULL.
+  ///
+  /// * `column` - The number of the column which value is to be tested with `PQgetisnull`. 0-based.
   pub fn is_null (&self, column: u32) -> bool {
     if column > self.0.columns {panic! ("Column index {} is out of range (0..{})", column, self.0.columns)}
     1 == unsafe {pq::PQgetisnull ((self.0).res, self.1 as c_int, column as c_int)}}
 
   /// PostgreSQL internal OID number of the column type.
+  ///
+  /// * `column` - The number of the column which type is to be retrieved with `PQftype`. 0-based.
   pub fn ftype (&self, column: u32) -> pq::Oid {
     if column > self.0.columns {panic! ("Column index {} is out of range (0..{})", column, self.0.columns)}
     unsafe {pq::PQftype ((self.0).res, column as c_int)}}
 
   /// Returns the column name associated with the given column number. Column numbers start at 0.
+  ///
+  /// * `column` - The number of the column. 0-based.
   pub fn fname (&'a self, column: u32) -> Result<&'a str, Utf8Error> {
     self.0.fname (column)}
 
@@ -160,19 +166,29 @@ impl<'a> PgRow<'a> {
   /// Returns the number of columns in the row. Row numbers start at 0.
   pub fn len (&self) -> u32 {self.0.columns}
 
+  /// Get the byte slice of a value in the given column.
+  ///
   /// Returns an empty array if the value is NULL.
+  ///
+  /// * `column` - The column number. 0-based.
   pub fn col (&self, column: u32) -> &'a [u8] {
     if column > self.0.columns {panic! ("Column index {} is out of range (0..{})", column, self.0.columns)}
     let len = unsafe {pq::PQgetlength ((self.0).res, self.1 as c_int, column as c_int)};
     let val = unsafe {pq::PQgetvalue ((self.0).res, self.1 as c_int, column as c_int)};
     unsafe {from_raw_parts (val as *const u8, len as usize)}}
 
+  /// Tries to get an UTF-8 slice of a value in the given column.
+  ///
   /// Returns an empty string if the value is NULL.
+  ///
+  /// * `column` - The column number. 0-based.
   pub fn col_str (&self, column: u32) -> Result<&'a str, std::str::Utf8Error> {
     if column > self.0.columns {panic! ("Column index {} is out of range (0..{})", column, self.0.columns)}
     unsafe {CStr::from_ptr (pq::PQgetvalue ((self.0).res, self.1 as c_int, column as c_int))} .to_str()}
 
   /// Binary data unescaped from a bytea column.
+  ///
+  /// * `column` - The column number. 0-based.
   pub fn bytea (&self, column: u32) -> Vec<u8> {
     if column > self.0.columns {panic! ("Column index {} is out of range (0..{})", column, self.0.columns)}
     let mut len: size_t = 0;
@@ -224,7 +240,7 @@ impl<'a> PgRow<'a> {
         oid => return Err (PgFutureErr::UnknownType (String::from (name), oid))}})}
 
   /// Auto-unpack the column value.
-  pub fn col_deserialize<T: Deserialize> (&self, column: u32, name: &str) -> Result<T, PgFutureErr> {
+  pub fn col_deserialize<T: DeserializeOwned> (&self, column: u32, name: &str) -> Result<T, PgFutureErr> {
     if !self.is_null (column) {
       match self.ftype (column) {
         114 | 3802 =>  // 114 json, 3802 jsonb
@@ -299,7 +315,7 @@ impl PgResult {
   ///   }
   /// }
   /// ```
-  pub fn deserialize<T: Deserialize> (&self) -> Result<Vec<T>, PgFutureErr> {
+  pub fn deserialize<T: DeserializeOwned> (&self) -> Result<Vec<T>, PgFutureErr> {
     let mut jrows: Vec<T> = Vec::with_capacity (self.len() as usize);
     for row in self.iter() {jrows.push (json::from_value (row.to_json()?) ?)}
     Ok (jrows)}}
