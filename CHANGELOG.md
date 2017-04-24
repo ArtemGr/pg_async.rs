@@ -3,6 +3,10 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](http://keepachangelog.com/) and this project adheres to [Semantic Versioning](http://semver.org/).
 
+### [0.7.1] - 2017-04-24
+`+` Unit tests now have the ability to emulate server errors.  
+`!` Fixed a panic happening during a database restart.
+
 ### [0.7.0] - 2017-04-20
 `*` Serde 0.8 -> 1.0.
 

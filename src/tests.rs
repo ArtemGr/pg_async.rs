@@ -1,5 +1,8 @@
+use gstuff::now_float;
 use std::fs;
 use std::io::{self, BufRead};
+//use std::thread;
+//use std::time::Duration;
 use super::*;
 
 lazy_static! {
@@ -103,3 +106,24 @@ fn check_sync<T: Sync>(_: &T) {}
   assert_eq! (row.one, 1);
   assert_eq! (row.a, b'a');
   assert_eq! (row.bom, 0xEF);}
+
+
+// --- Automatic reconnection tests -------
+
+#[test] fn reconnect_01() {
+  let cluster = Arc::new (Cluster::new() .expect ("!Cluster"));
+  for dsn in DSNS.iter() {cluster.connect (dsn.clone(), 1) .expect ("!connect")}
+  assert_eq! (cluster.execute ("SELECT 1") .wait().unwrap() [0].row (0) .col (0), b"1");
+  cluster.emulate_error_at (1, "server closed the connection unexpectedly".into());
+
+  // { // Allow the servers to come back online after a while.
+  //   let cluster = cluster.clone();
+  //   thread::spawn (move || {
+  //     thread::sleep (Duration::from_millis (100));
+  //     cluster.emulate_error_at (0, String::new());}); }
+
+  let started_at = now_float();
+  assert_eq! (cluster.execute ("SELECT 1") .wait().unwrap() [0].row (0) .col (0), b"1");
+  assert_eq! (cluster.execute ("SELECT 1") .wait().unwrap() [0].row (0) .col (0), b"1");
+  let delta = now_float() - started_at;
+  assert! (delta < 0.1, "delta: {}", delta);}  // This error happens *after* the future has been processed and so it doesn't affect response times much.

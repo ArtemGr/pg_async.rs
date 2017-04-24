@@ -523,6 +523,9 @@ impl Future for PgFuture {
 enum Message {
   Connect (String, u8),
   Execute (PgFuture),
+  /// Tells the event loop to emulate an error. Is only effective in the test builds.
+  EmulateErrorAt (u8, String),
+  /// Stops the event loop.
   Drop}
 
 #[derive(Debug)]
@@ -553,8 +556,6 @@ const PIPELINE_LIM_BYTES: usize = 16384;
 
 // To reconnect or to panic, that is the question...
 fn reconnect_heuristic (err: &str) -> bool {
-  // TODO: We should *probably* reconnect by default but then we should *at least* log the error.
-  //       So the plan is: 1) implement logging (crates.io/crates/log), 2) reconnect by default, 3) mark basic HA as implemented.
   err.starts_with ("server closed the connection unexpectedly") ||
   err.starts_with ("SSL SYSCALL error")}
 
@@ -569,6 +570,8 @@ fn event_loop (rx: Receiver<Message>, read_end: c_int) {
   let mut pending_futures: VecDeque<PgFuture> = VecDeque::new();
   let mut sql = String::with_capacity (PIPELINE_LIM_BYTES + 1024);
   let mut sql_futures = Vec::with_capacity (PIPELINE_LIM_COMMANDS);
+  let mut error_at: u8 = 0;  // Hardcoded identifier of a place where an error should be emulated.
+  let mut error_at_message = String::new();  // The error message to emulate at `error_at`.
 
   macro_rules! schedule {($pg_future: ident) => {{
     match $pg_future.0.op.scheduling {
@@ -600,6 +603,7 @@ fn event_loop (rx: Receiver<Message>, read_end: c_int) {
               connection_pending: true,
               in_flight_init: false});}},
         Message::Execute (pg_future) => schedule! (pg_future),
+        Message::EmulateErrorAt (at, message) => {error_at = at; error_at_message = message},
         Message::Drop => break 'event_loop}}}  // Cluster is dropping.
 
     fds.clear();
@@ -726,7 +730,7 @@ fn event_loop (rx: Receiver<Message>, read_end: c_int) {
         loop {
           if unsafe {pq::PQisBusy (conn.handle)} == 1 {break}
           let mut error = false;
-          let mut after_future = false;
+          let mut after_future = false;  // True if we've popped a future from `conn.in_flight`.
           if conn.in_flight_init {
             conn.in_flight_init = false;
             let res = unsafe {pq::PQgetResult (conn.handle)};
@@ -796,12 +800,20 @@ fn event_loop (rx: Receiver<Message>, read_end: c_int) {
 
             if let Some (ref task) = sync.task {task.unpark()}}
 
-          if error {
+          if error || (cfg! (test) && error_at == 1) {
             if after_future {
               // Need to call `PQgetResult` one last time in order to flip a flag in libpq. Otherwise `PQsendQuery` won't work.
               let res = unsafe {pq::PQgetResult (conn.handle)};
-              // TODO: Handle PostgreSQL restarts. Test with "icecat --select-attributes".
-              if res != null_mut() {panic! ("Unexpected result after an error")}
+              if res != null_mut() || (cfg! (test) && error_at == 1) {
+                let err = if cfg! (test) && error_at == 1 {error_at_message.clone()} else {error_message (conn.handle)};
+                if reconnect_heuristic (&err) {
+                  // Experimental reconnection support.
+                  // TODO: Log the reconnection.
+                  unsafe {pq::PQresetStart (conn.handle)};
+                  conn.connection_pending = true;
+                  for future in sql_futures.drain (..) {reschedule! (conn, future)}
+                  continue 'connections_loop}
+                panic! ("Unexpected result after an error. error_message: {}", err)}
 
               // We're using BEGIN-COMMIT, so we should ROLLBACK after a failure.
               // Otherwise we'll see "current transaction is aborted, commands ignored until end of transaction block".
@@ -896,7 +908,18 @@ impl Cluster {
     { let tx = match self.tx.lock() {Ok (k) => k, Err (err) => return PgFuture::error (err.into())};
       if let Err (err) = tx.send (Message::Execute (pg_future.clone())) {return PgFuture::error (err.into())}; }
     if let Err (err) = wake_up (self.write_end, 2) {panic! ("{}", err)}
-    pg_future}}
+    pg_future}
+
+  /// Emulate an error. Only works in test builds. Might panic.
+  ///
+  /// * `at` - Identifies a hardcoded place (or a chain of places) where an [libpq] error is to be emulated.
+  /// * `message` - The emulated error message.
+  #[doc(hidden)]
+  pub fn emulate_error_at (&self, at: u8, message: String) {
+    if cfg! (test) {
+      { let tx = self.tx.lock().expect ("!lock");
+        tx.send (Message::EmulateErrorAt (at, message)) .expect ("!send"); }
+      if let Err (err) = wake_up (self.write_end, 2) {panic! ("{}", err)}}}}
 
 impl Drop for Cluster {
   fn drop (&mut self) {

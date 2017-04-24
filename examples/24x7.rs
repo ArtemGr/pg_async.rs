@@ -43,7 +43,7 @@ fn main() {
   let pool = CpuPool::new (1);
   let in_flight = Arc::new (Mutex::new (BTreeMap::new()));
   loop {
-    for _ in 0..99 {  // Generate a decent load spike to ensure that all the connections are busy and pipelining.
+    for _ in 0..999 {  // Generate a decent load spike to ensure that all the connections are busy and pipelining.
       let rid = rng.next_u64();
 
       let f = match pin {
