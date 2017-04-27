@@ -107,6 +107,46 @@ fn check_sync<T: Sync>(_: &T) {}
   assert_eq! (row.a, b'a');
   assert_eq! (row.bom, 0xEF);}
 
+#[test] fn timeout() {
+  use super::PgQueryPiece::{Static as S};
+
+  let cluster = Arc::new (Cluster::new() .expect ("!Cluster"));
+  for dsn in DSNS.iter() {cluster.connect (dsn.clone(), 1) .expect ("!connect")}
+  cluster.execute ("SELECT 1") .wait().expect ("!select");  // Wait for connection.
+
+  // Sanity check: see if pg_sleep works.
+  let started = now_float();
+  cluster.execute ("SELECT pg_sleep (0.10)") .wait().expect ("!pg_sleep");
+  let delta = now_float() - started;
+  assert! (0.09 < delta && delta < 0.2, "delta: {}", delta);
+
+  // Make sure we can get the results if the timeout *wasn't* triggered.
+  assert_eq! (cluster.execute ((1, vec! [S ("SELECT 1")], 0.1)) .wait().unwrap() [0].row (0) .col (0), b"1");
+
+  // Now see that a long sleep is interrupted by timeout.
+  for _ in 0..5 {
+    let started = now_float();
+    let op = PgOperation {
+      statements: 1,
+      query_pieces: vec! [S ("SELECT pg_sleep (10)")],
+      timeouts_at: now_float() + 0.1,
+      ..Default::default()};
+    match cluster.execute (op) .wait() {
+      Ok (_pr) => panic! ("Timeout failed to work!"),
+      Err (err) => {
+        assert! (err.to_string().contains ("canceling statement due to statement timeout"), "err: {}, {:?}", err, err);
+        assert! (err.pg_timeout())}};
+
+    let delta = now_float() - started;
+    assert! (0.09 < delta && delta < 0.3, "delta: {}", delta);}
+
+  // See that using a timeout doesn't have a lingering effect.
+  for _ in 0..5 {
+    let started = now_float();
+    let pr = cluster.execute ((2, "SELECT pg_sleep (0.20); SELECT 1")) .wait().expect ("!pg_sleep");
+    let delta = now_float() - started;
+    assert! (0.19 < delta && delta < 0.3, "delta: {}", delta);
+    assert_eq! (pr[1].row (0) .col (0), b"1");}}
 
 // --- Automatic reconnection tests -------
 

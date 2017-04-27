@@ -53,8 +53,7 @@ fn main() {
             scheduling: PgSchedulingMode::PinToConnection (pin),
             statements: 1,
             query_pieces: vec! [P (fomat! ("SELECT " (rid) " AS rid"))],
-            on_escape: None
-          })}};
+            ..Default::default()})}};
 
       let f: Box<Future<Item=(), Error=()> + Send> = {
         let finished = finished.clone();

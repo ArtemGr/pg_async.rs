@@ -18,6 +18,7 @@ extern crate serde_json;
 
 use futures::{Future, Poll, Async};
 use futures::task::{park, Task};
+use gstuff::now_float;
 use inlinable_string::InlinableString;
 use libc::{c_char, c_int, c_void, size_t};
 use nix::poll::{self, EventFlags, PollFd};
@@ -98,7 +99,16 @@ pub struct PgOperation {
   ///         let mut op: PgOperation = query.into_query_pieces();
   ///         if debug {op.on_escape = Some (Box::new (|sql| log! ("escaped query: {}", sql)))}
   ///         let f = cluster.execute (op);
-  pub on_escape: Option<Box<Fn(&str) + Send + Sync + 'static>>}
+  pub on_escape: Option<Box<Fn(&str) + Send + Sync + 'static>>,
+
+  /// The time, in seconds since UNIX epoch, with fractions, when the operation SHOULD timeout.
+  ///
+  /// If the timeout is *negative* then it only affects the scheduling (TBD).  
+  /// If, on the other hand, the timeout is *positive*
+  /// then "SET statement_timeout" is used on the database side to prevent the operation from taking too long.
+  ///
+  /// Since timeouts affect a whole statement, operations with a positive timeout are never pipelined!
+  pub timeouts_at: f64}
 
 impl fmt::Debug for PgOperation {
   fn fmt (&self, fm: &mut fmt::Formatter) -> fmt::Result {
@@ -112,27 +122,31 @@ pub trait IntoQueryPieces {
 
 impl IntoQueryPieces for String {
   fn into_query_pieces (self) -> PgOperation {
-    PgOperation {statements: 1, query_pieces: vec! [PgQueryPiece::Plain (self)], scheduling: PgSchedulingMode::AnythingGoes, on_escape: None}}}
+    PgOperation {statements: 1, query_pieces: vec! [PgQueryPiece::Plain (self)], ..Default::default()}}}
 
 impl IntoQueryPieces for &'static str {
   fn into_query_pieces (self) -> PgOperation {
-    PgOperation {statements: 1, query_pieces: vec! [PgQueryPiece::Static (self)], scheduling: PgSchedulingMode::AnythingGoes, on_escape: None}}}
+    PgOperation {statements: 1, query_pieces: vec! [PgQueryPiece::Static (self)], ..Default::default()}}}
 
 impl IntoQueryPieces for Vec<PgQueryPiece> {
   fn into_query_pieces (self) -> PgOperation {
-    PgOperation {statements: 1, query_pieces: self, scheduling: PgSchedulingMode::AnythingGoes, on_escape: None}}}
+    PgOperation {statements: 1, query_pieces: self, ..Default::default()}}}
 
 impl IntoQueryPieces for (u32, &'static str) {
   fn into_query_pieces (self) -> PgOperation {
-    PgOperation {statements: self.0, query_pieces: vec! [PgQueryPiece::Static (self.1)], scheduling: PgSchedulingMode::AnythingGoes, on_escape: None}}}
+    PgOperation {statements: self.0, query_pieces: vec! [PgQueryPiece::Static (self.1)], ..Default::default()}}}
 
 impl IntoQueryPieces for (u32, String) {
   fn into_query_pieces (self) -> PgOperation {
-    PgOperation {statements: self.0, query_pieces: vec! [PgQueryPiece::Plain (self.1)], scheduling: PgSchedulingMode::AnythingGoes, on_escape: None}}}
+    PgOperation {statements: self.0, query_pieces: vec! [PgQueryPiece::Plain (self.1)], ..Default::default()}}}
 
 impl IntoQueryPieces for (u32, Vec<PgQueryPiece>) {
   fn into_query_pieces (self) -> PgOperation {
-    PgOperation {statements: self.0, query_pieces: self.1, scheduling: PgSchedulingMode::AnythingGoes, on_escape: None}}}
+    PgOperation {statements: self.0, query_pieces: self.1, ..Default::default()}}}
+
+impl IntoQueryPieces for (u32, Vec<PgQueryPiece>, f32) {
+  fn into_query_pieces (self) -> PgOperation {
+    PgOperation {statements: self.0, query_pieces: self.1, timeouts_at: now_float() + self.2 as f64, ..Default::default()}}}
 
 impl IntoQueryPieces for PgOperation {
   fn into_query_pieces (self) -> PgOperation {self}}
@@ -382,6 +396,14 @@ pub enum PgFutureErr {
   UnknownType (String, pq::Oid),
   Str (&'static str)}
 
+impl PgFutureErr {
+  /// True if the future was likely to have been terminated due to a PostgreSQL timeout.
+  pub fn pg_timeout (&self) -> bool {
+    if let &PgFutureErr::Sql (ref pg_sql_err) = self {
+      if pg_sql_err.sqlstate == "57014" {
+        return true}}
+    false}}
+
 impl fmt::Debug for PgFutureErr {
   fn fmt (&self, ft: &mut fmt::Formatter) -> Result<(), fmt::Error> {
     match self {
@@ -473,11 +495,7 @@ impl PgFuture {
   fn error (err: PgFutureErr) -> PgFuture {
     PgFuture (Arc::new (PgFutureImpl {
       id: 0,
-      op: PgOperation {
-        query_pieces: Vec::new(),
-        statements: 0,
-        scheduling: PgSchedulingMode::AnythingGoes,
-        on_escape: None},
+      op: PgOperation::default(),
       sync: Mutex::new (PgFutureSync {
         results: Vec::new(),
         task: None}),
@@ -539,7 +557,9 @@ struct Connection {
   /// True if we're waiting for the server connection to happen.
   connection_pending: bool,
   /// True if there is an internal statement in flight.
-  in_flight_init: bool}
+  in_flight_init: bool,
+  /// True if statement_timeout was previously used. If it was, then we'd need to reset it back to 0.
+  statement_timeout: bool}
 
 impl Connection {
   fn free (&self) -> bool {
@@ -601,7 +621,8 @@ fn event_loop (rx: Receiver<Message>, read_end: c_int) {
               in_flight: VecDeque::new(),
               pinned_pending_futures: VecDeque::new(),
               connection_pending: true,
-              in_flight_init: false});}},
+              in_flight_init: false,
+              statement_timeout: false});}},
         Message::Execute (pg_future) => schedule! (pg_future),
         Message::EmulateErrorAt (at, message) => {error_at = at; error_at_message = message},
         Message::Drop => break 'event_loop}}}  // Cluster is dropping.
@@ -648,15 +669,38 @@ fn event_loop (rx: Receiver<Message>, read_end: c_int) {
       sql.clear();
       sql_futures.clear();
       let mut first = true;
+      let mut statement_timeout_ms: u32 = 0;
       loop {
         if sql.len() >= PIPELINE_LIM_BYTES {break}
         if sql_futures.len() + 1 >= PIPELINE_LIM_COMMANDS {break}
+        if statement_timeout_ms != 0 && !first {break}
         let pending = match pending_futures.pop_front() {
           Some (f) => f,
           None => match conn.pinned_pending_futures.pop_front() {
             Some (f) => f,
             None => break}};
-        if first {first = false} else {sql.push_str ("; ")}
+
+        // If the operation is using a statement_timeout then it must be alone and not pipelined with other operations.
+        if pending.0.op.timeouts_at > 0.0 {
+          if first {
+            let now = now_float();
+            let remains = pending.0.op.timeouts_at - now;
+            statement_timeout_ms = if remains <= 0.001 {1} else {(remains * 1000.0) as u32 + 1};
+            conn.statement_timeout = true;
+          } else {
+            pending_futures.push_front (pending);
+            break}}
+
+        if first {
+          first = false;
+          if statement_timeout_ms != 0 {
+            write! (&mut sql, "SET statement_timeout = {}; ", statement_timeout_ms) .expect ("!write");
+          } else if conn.statement_timeout {
+            // NB: We shall NOT reset the `conn.statement_timeout` here because the `sql` might end being malformed.
+            sql.push_str ("SET statement_timeout = 0; ")}
+        } else {
+          sql.push_str ("; ")}
+
         write! (&mut sql, "BEGIN; SELECT {} AS future_id; ", pending.0.id) .expect ("!write");
 
         let escape_start_len = sql.len();
@@ -694,6 +738,7 @@ fn event_loop (rx: Receiver<Message>, read_end: c_int) {
       let res = unsafe {pq::PQgetResult (conn.handle)};
       if res != null_mut() {panic! ("Stray result detected before PQsendQuery! {:?}", res);}
 
+      //println! ("sql: {}", sql);  // TODO: turn on debug logging in unit tests.
       let sql = CString::new (&sql[..]) .expect ("sql !CString");
       let rc = unsafe {pq::PQsendQuery (conn.handle, sql.as_ptr())};
       if rc == 0 {
@@ -741,10 +786,11 @@ fn event_loop (rx: Receiver<Message>, read_end: c_int) {
             after_future = true;
 
             // Every statement is wrapped in a "BEGIN; SELECT $id; $statement; COMMIT" transaction and produces not one but three results.
+            // If `conn.statement_timeout` is true then there is also a "SET statement_timeout = $ms;" before the first transaction.
 
-            { let begin_res = unsafe {pq::PQgetResult (conn.handle)};
-              if begin_res == null_mut() {panic! ("Got no BEGIN result for {:?}", pg_future)}
-              if let Some (error_status) = error_in_result (begin_res) {
+            { let first_res = unsafe {pq::PQgetResult (conn.handle)};
+              if first_res == null_mut() {panic! ("No first result for {:?}", pg_future)}
+              if let Some (error_status) = error_in_result (first_res) {
                 // BEGIN fails when there is a syntax error in the pipeline SQL.
                 // The error might be in a statement that exists later in the pipeline and is not related to `pg_future`,
                 // but to properly match the error to the right `pg_future` we'd have to parse the error message for the exact location of the error
@@ -758,7 +804,7 @@ fn event_loop (rx: Receiver<Message>, read_end: c_int) {
                 //error = true;
 
                 // But for now it might be better if we just panic. SQL is code and syntax errors aren't usually expected.
-                let sqlstate = unsafe {CStr::from_ptr (pq::PQresultErrorField (begin_res, pq::PG_DIAG_SQLSTATE))} .to_str() .expect ("!to_str");
+                let sqlstate = unsafe {CStr::from_ptr (pq::PQresultErrorField (first_res, pq::PG_DIAG_SQLSTATE))} .to_str() .expect ("!to_str");
                 if sqlstate == "57P01" {
                   // Experimental reconnection support.
                   // TODO: Log the reconnection.
@@ -769,9 +815,21 @@ fn event_loop (rx: Receiver<Message>, read_end: c_int) {
                   continue 'connections_loop}
 
                 let status = unsafe {CStr::from_ptr (pq::PQresStatus (error_status))} .to_str() .expect ("!to_str");
+                let err = unsafe {CStr::from_ptr (pq::PQresultErrorMessage (first_res))} .to_str() .expect ("!to_str");
+                panic! ("First statement failed. Probably a syntax error in one of the pipelined SQL statements. {}, {},\n{}", status, sqlstate, err);}
+              unsafe {pq::PQclear (first_res)} }
+
+            if pg_future.0.op.timeouts_at > 0.0 || conn.statement_timeout {
+              if !(pg_future.0.op.timeouts_at > 0.0) {  // So the first statement was "SET statement_timeout = 0;" and it worked.
+                conn.statement_timeout = false}
+
+              let begin_res = unsafe {pq::PQgetResult (conn.handle)};
+              if begin_res == null_mut() {panic! ("Got no BEGIN result for {:?}", pg_future)}
+              if let Some (error_status) = error_in_result (begin_res) {
+                let sqlstate = unsafe {CStr::from_ptr (pq::PQresultErrorField (begin_res, pq::PG_DIAG_SQLSTATE))} .to_str() .expect ("!to_str");
+                let status = unsafe {CStr::from_ptr (pq::PQresStatus (error_status))} .to_str() .expect ("!to_str");
                 let err = unsafe {CStr::from_ptr (pq::PQresultErrorMessage (begin_res))} .to_str() .expect ("!to_str");
-                panic! ("BEGIN failed. Probably a syntax error in one of the pipelined SQL statements. {}, {},\n{}", status, sqlstate, err);}
-              unsafe {pq::PQclear (begin_res)} }
+                panic! ("BEGIN failed. {}, {},\n{}", status, sqlstate, err);}}
 
             let mut sync = pg_future.0.sync.lock().expect ("!lock");
 
