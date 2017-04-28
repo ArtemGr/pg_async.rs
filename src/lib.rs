@@ -425,7 +425,7 @@ impl fmt::Display for PgFutureErr {
       &PgFutureErr::SendError (ref err) => write! (ft, "PgFutureErr::SendError ({})", err),
       &PgFutureErr::NixError (ref err) => write! (ft, "PgFutureErr::NixError ({})", err),
       &PgFutureErr::Utf8Error (ref err) => write! (ft, "PgFutureErr::Utf8Error ({})", err),
-      &PgFutureErr::Sql (ref se) => ft.write_str (&se.message),
+      &PgFutureErr::Sql (ref se) => write! (ft, "{}; {}", se.sqlstate, se.message),
       &PgFutureErr::Json (ref err) => write! (ft, "PgFutureErr::Json ({})", err),
       &PgFutureErr::Int (ref err) => write! (ft, "PgFutureErr::Int ({})", err),
       &PgFutureErr::Float (ref err) => write! (ft, "PgFutureErr::Float ({})", err),

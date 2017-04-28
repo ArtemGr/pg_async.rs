@@ -135,6 +135,7 @@ fn check_sync<T: Sync>(_: &T) {}
       Ok (_pr) => panic! ("Timeout failed to work!"),
       Err (err) => {
         assert! (err.to_string().contains ("canceling statement due to statement timeout"), "err: {}, {:?}", err, err);
+        assert! (err.to_string().starts_with ("57014;"), "err: {}, {:?}", err, err);  // SQLSTATE.
         assert! (err.pg_timeout())}};
 
     let delta = now_float() - started;
