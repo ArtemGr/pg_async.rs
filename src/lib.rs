@@ -25,6 +25,7 @@ use nix::poll::{self, EventFlags, PollFd};
 use nix::fcntl::{O_NONBLOCK, O_CLOEXEC};
 use serde::de::DeserializeOwned;
 use serde_json::{self as json, Value as Json};
+use std::cmp::max;
 use std::collections::VecDeque;
 use std::convert::From;
 use std::error::Error;
@@ -685,7 +686,9 @@ fn event_loop (rx: Receiver<Message>, read_end: c_int) {
           if first {
             let now = now_float();
             let remains = pending.0.op.timeouts_at - now;
-            statement_timeout_ms = if remains <= 0.001 {1} else {(remains * 1000.0) as u32 + 1};
+            // NB: 20ms is a minimal timeout we can allow.
+            // With too small a timeout we might have trouble removing it ("SET statement_timeout = 0" might timeout).
+            statement_timeout_ms = max ((remains * 1000.0) as u32 + 1, 20);
             conn.statement_timeout = true;
           } else {
             pending_futures.push_front (pending);
@@ -805,7 +808,8 @@ fn event_loop (rx: Receiver<Message>, read_end: c_int) {
 
                 // But for now it might be better if we just panic. SQL is code and syntax errors aren't usually expected.
                 let sqlstate = unsafe {CStr::from_ptr (pq::PQresultErrorField (first_res, pq::PG_DIAG_SQLSTATE))} .to_str() .expect ("!to_str");
-                if sqlstate == "57P01" {
+                // NB: "57014" might happen in "SET statement_timeout = 0" when the previous timeout was too small! I've seen this happen (#144577297).
+                if sqlstate == "57P01" || sqlstate == "57014" {
                   // Experimental reconnection support.
                   // TODO: Log the reconnection.
                   unsafe {pq::PQresetStart (conn.handle)};

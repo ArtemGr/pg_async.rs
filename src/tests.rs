@@ -118,7 +118,7 @@ fn check_sync<T: Sync>(_: &T) {}
   let started = now_float();
   cluster.execute ("SELECT pg_sleep (0.10)") .wait().expect ("!pg_sleep");
   let delta = now_float() - started;
-  assert! (0.09 < delta && delta < 0.2, "delta: {}", delta);
+  assert! (0.09 < delta && delta < 0.3, "delta: {}", delta);
 
   // Make sure we can get the results if the timeout *wasn't* triggered.
   assert_eq! (cluster.execute ((1, vec! [S ("SELECT 1")], 0.1)) .wait().unwrap() [0].row (0) .col (0), b"1");
