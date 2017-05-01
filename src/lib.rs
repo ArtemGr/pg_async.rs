@@ -688,7 +688,7 @@ fn event_loop (rx: Receiver<Message>, read_end: c_int) {
             let remains = pending.0.op.timeouts_at - now;
             // NB: 20ms is a minimal timeout we can allow.
             // With too small a timeout we might have trouble removing it ("SET statement_timeout = 0" might timeout).
-            statement_timeout_ms = max ((remains * 1000.0) as u32 + 1, 20);
+            statement_timeout_ms = max ((remains * 1000.0) as i32 + 1, 20) as u32;
             conn.statement_timeout = true;
           } else {
             pending_futures.push_front (pending);
