@@ -5,6 +5,7 @@
 
 #![feature(type_ascription, integer_atomics, custom_derive)]
 
+extern crate chrono;
 extern crate futures;
 #[macro_use] extern crate gstuff;
 extern crate inlinable_string;
@@ -31,7 +32,8 @@ use std::convert::From;
 use std::error::Error;
 use std::ffi::{CString, CStr};
 use std::fmt;
-use std::io;
+use std::io::{self, Write};
+use std::mem::uninitialized;
 use std::ptr::null_mut;
 use std::slice::from_raw_parts;
 use std::str::{from_utf8_unchecked, from_utf8, Utf8Error};
@@ -238,8 +240,19 @@ impl<'a> PgRow<'a> {
           let f: f64 = self.col_str (column) ?.parse()?;
           Json::Number (json::Number::from_f64 (f) .ok_or ("The float is not a JSON number") ?)},
         705 => Json::String (from_utf8 (self.col (column)) ?.into()),  // 705 unknown. SELECT 'foo'.
+        1184 => {  // 1184 timestamptz
+          let ts = unsafe {from_utf8_unchecked (self.col (column))};
+          let mut buf: [u8; 128] = unsafe {uninitialized()};
+          let buf = gstring! (buf, {
+            write! (buf, "{}", ts) .expect ("!write");
+            // Turn "+03" into "+0300" to match the "%z" specifier.
+            if ts.chars().rev().take_while (|ch| ch.is_digit (10)) .count() == 2 {write! (buf, "00") .expect ("!write")}});
+          let dt = match chrono::datetime::DateTime::parse_from_str (buf, "%Y-%m-%d %H:%M:%S%.f%z") {
+            Ok (dt) => dt,
+            Err (err) => panic! ("!parse_from_str ({}): {}", buf, err)};
+          let f = dt.timestamp() as f64 + (dt.timestamp_subsec_millis() as f64 / 1000.0);
+          Json::Number (json::Number::from_f64 (f) .ok_or ("Timestamp is not a JSON number") ?)},
         // TODO (types I use):
-        // 1184 => Type::TimestampTZ,
         // 1700 => Type::Numeric,
         // 3926 => Type::Int8Range
         oid if oid > 16000 => {

@@ -149,6 +149,13 @@ fn check_sync<T: Sync>(_: &T) {}
     assert! (0.19 < delta && delta < 0.3, "delta: {}", delta);
     assert_eq! (pr[1].row (0) .col (0), b"1");}}
 
+#[test] fn timestamptz() {
+  let cluster = Cluster::new() .expect ("!Cluster");
+  for dsn in DSNS.iter() {cluster.connect (dsn.clone(), 1) .expect ("!connect")}
+  #[derive(Deserialize)] struct Row {tz: f64, t: f64}
+  let row: Row = cluster.execute ("SELECT now() AS tz, EXTRACT(EPOCH FROM now()) AS t") .wait().unwrap()[0].deserialize().unwrap().pop().unwrap();
+  assert! ((row.tz - row.t).abs() < 0.001, "tz: {}, t: {}", row.tz, row.t)}
+
 // --- Automatic reconnection tests -------
 
 #[test] fn reconnect_01() {
