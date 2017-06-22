@@ -247,7 +247,7 @@ impl<'a> PgRow<'a> {
             write! (buf, "{}", ts) .expect ("!write");
             // Turn "+03" into "+0300" to match the "%z" specifier.
             if ts.chars().rev().take_while (|ch| ch.is_digit (10)) .count() == 2 {write! (buf, "00") .expect ("!write")}});
-          let dt = match chrono::datetime::DateTime::parse_from_str (buf, "%Y-%m-%d %H:%M:%S%.f%z") {
+          let dt = match chrono::DateTime::parse_from_str (buf, "%Y-%m-%d %H:%M:%S%.f%z") {
             Ok (dt) => dt,
             Err (err) => panic! ("!parse_from_str ({}): {}", buf, err)};
           let f = dt.timestamp() as f64 + (dt.timestamp_subsec_millis() as f64 / 1000.0);
@@ -537,7 +537,8 @@ impl Future for PgFuture {
     for (pr, num) in sync.results.iter().zip (0..) {
       if let Some (status) = error_in_result (pr.res) {
         let status = unsafe {CStr::from_ptr (pq::PQresStatus (status))} .to_str()?;
-        let sqlstate = unsafe {CStr::from_ptr (pq::PQresultErrorField (pr.res, pq::PG_DIAG_SQLSTATE))} .to_str()?;
+        let sqlstate = unsafe {pq::PQresultErrorField (pr.res, pq::PG_DIAG_SQLSTATE)};  // NB: I've seen it returning `nullptr`.
+        let sqlstate = if sqlstate == null_mut() {""} else {unsafe {CStr::from_ptr (sqlstate)} .to_str()?};
         let err = unsafe {CStr::from_ptr (pq::PQresultErrorMessage (pr.res))} .to_str()?;
         return Err (PgFutureErr::Sql (PgSqlErr {
           imp: self.0.clone(),
