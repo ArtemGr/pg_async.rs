@@ -1,6 +1,6 @@
 [package]
 name = "pg_async"
-version = "0.8.5"
+version = "0.8.6"
 authors = ["Artem <artemciy@gmail.com>"]
 links = "pq"
 build = "build.rs"
@@ -19,12 +19,13 @@ crate-type = ["rlib"]
 doctest = false 
 
 [dependencies]
+atomic = "0.4"
 chrono = "0.4"
 futures = "0.1"
-gstuff = "0.4"
+gstuff = "0.5"
 inlinable_string = "0.1"
-itertools = "0.6"
-lazy_static = "0.2"
+itertools = "0.8"
+lazy_static = "1"
 libc = "0.2"
 nix = "0.8"
 serde = "1"

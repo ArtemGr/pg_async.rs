@@ -3,8 +3,7 @@
 // NB: There is a work in progress on a better pipelining support in libpq: https://commitfest.postgresql.org/10/634/
 //     http://2ndquadrant.github.io/postgres/libpq-batch-mode.html
 
-#![feature(type_ascription, integer_atomics, custom_derive)]
-
+extern crate atomic;
 extern crate chrono;
 extern crate futures;
 #[macro_use] extern crate gstuff;
@@ -17,8 +16,9 @@ extern crate serde;
 #[cfg(test)] #[macro_use] extern crate serde_derive;
 extern crate serde_json;
 
+use atomic::Atomic;
 use futures::{Future, Poll, Async};
-use futures::task::{park, Task};
+use futures::task::{current, Task};
 use gstuff::now_float;
 use inlinable_string::InlinableString;
 use libc::{c_char, c_int, c_void, size_t};
@@ -38,7 +38,7 @@ use std::ptr::null_mut;
 use std::slice::from_raw_parts;
 use std::str::{from_utf8_unchecked, from_utf8, Utf8Error};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{Ordering};
 use std::sync::mpsc::{channel, Sender, Receiver, SendError, TryRecvError};
 use std::thread::JoinHandle;
 
@@ -233,7 +233,7 @@ impl<'a> PgRow<'a> {
           // Funny thing is, libpq "eats" the zero character, turns it into an empty string.
           let slice = self.col (column);
           Json::Number ((if slice.is_empty() {0} else {slice[0]}) .into())},
-        20 | 21 | 23 => Json::Number ((self.col_str (column) ?.parse()? :i64).into()),  // 20 bigint, 21 smallint, 23 integer
+        20 | 21 | 23 => Json::Number ((self.col_str (column) ?.parse::<i64>()?).into()),  // 20 bigint, 21 smallint, 23 integer
         25 | 1042 | 1043 | 3614 => Json::String (from_utf8 (self.col (column)) ?.into()),  // 25 text, 1042 char, 1043 varchar, 3614 tsvector
         114 | 3802 => json::from_slice (self.col (column)) ?,  // 114 json, 3802 jsonb
         700 | 701 => {  // 700 real, 701 double precision
@@ -531,7 +531,7 @@ impl Future for PgFuture {
     let mut sync = self.0.sync.lock()?;
 
     if sync.results.is_empty() {
-      sync.task = Some (park());
+      sync.task = Some (current());
       return Ok (Async::NotReady)}
 
     for (pr, num) in sync.results.iter().zip (0..) {
@@ -874,7 +874,7 @@ fn event_loop (rx: Receiver<Message>, read_end: c_int) {
                 rows: unsafe {pq::PQntuples (statement_res)} as u32,
                 columns: unsafe {pq::PQnfields (statement_res)} as u32});}
 
-            if let Some (ref task) = sync.task {task.unpark()}}
+            if let Some (ref task) = sync.task {task.notify()}}
 
           if error || (cfg! (test) && error_at == 1) {
             if after_future {
@@ -925,7 +925,7 @@ pub struct Cluster {
   /// pipe2 file descriptor used to wake the poll thread.
   write_end: c_int,
   /// Used to generate the unique identifiers for the asynchronous SQL commands.
-  command_num: AtomicU64}
+  command_num: Atomic<u64>}
 
 impl Cluster {
   /// Start the thread.
@@ -937,7 +937,7 @@ impl Cluster {
       thread: Some (thread),
       tx: Mutex::new (tx),
       write_end: write_end,
-      command_num: AtomicU64::new (0)})}
+      command_num: Atomic::new (0u64)})}
 
   /// Setup a database connection to a [replicated] node.
   ///
@@ -977,7 +977,7 @@ impl Cluster {
   ///   cluster.execute (vec! [S ("SELECT * FROM foo WHERE bar = "), L (bar)]);
   /// ```
   pub fn execute<I: IntoQueryPieces> (&self, sql: I) -> PgFuture {
-    self.command_num.compare_and_swap (u64::max_value(), 0, Ordering::Relaxed);  // Recycle the set of identifiers.
+    let _ = self.command_num.compare_exchange (u64::max_value(), 0, Ordering::Relaxed, Ordering::Relaxed);  // Recycle the set of identifiers.
     let id = self.command_num.fetch_add (1, Ordering::Relaxed) + 1;
     let pg_future = PgFuture::new (id, sql.into_query_pieces());
 
