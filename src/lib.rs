@@ -3,18 +3,20 @@
 // NB: There is a work in progress on a better pipelining support in libpq: https://commitfest.postgresql.org/10/634/
 //     http://2ndquadrant.github.io/postgres/libpq-batch-mode.html
 
+#![allow(uncommon_codepoints)]
+
+#[cfg(test)] #[macro_use] extern crate lazy_static;
+#[cfg(test)] #[macro_use] extern crate serde_derive;
+#[macro_use] extern crate gstuff;
 extern crate atomic;
 extern crate chrono;
 extern crate futures;
-#[macro_use] extern crate gstuff;
 extern crate inlinable_string;
 extern crate itertools;
-#[cfg(test)] #[macro_use] extern crate lazy_static;
 extern crate libc;
 extern crate nix;
-extern crate serde;
-#[cfg(test)] #[macro_use] extern crate serde_derive;
 extern crate serde_json;
+extern crate serde;
 
 use atomic::Atomic;
 use futures::{Future, Poll, Async};
@@ -22,10 +24,10 @@ use futures::task::{current, Task};
 use gstuff::now_float;
 use inlinable_string::InlinableString;
 use libc::{c_char, c_int, c_void, size_t};
-use nix::poll::{self, EventFlags, PollFd};
-use nix::fcntl::{O_NONBLOCK, O_CLOEXEC};
-use serde::de::DeserializeOwned;
+use nix::fcntl::OFlag;
+use nix::poll::{self, PollFlags, PollFd};
 use serde_json::{self as json, Value as Json};
+use serde::de::DeserializeOwned;
 use std::cmp::max;
 use std::collections::VecDeque;
 use std::convert::From;
@@ -33,7 +35,8 @@ use std::error::Error;
 use std::ffi::{CString, CStr};
 use std::fmt;
 use std::io::{self, Write};
-use std::mem::uninitialized;
+use std::mem::MaybeUninit;
+use std::os::fd::{BorrowedFd, IntoRawFd};
 use std::ptr::null_mut;
 use std::slice::from_raw_parts;
 use std::str::{from_utf8_unchecked, from_utf8, Utf8Error};
@@ -102,7 +105,7 @@ pub struct PgOperation {
   ///         let mut op: PgOperation = query.into_query_pieces();
   ///         if debug {op.on_escape = Some (Box::new (|sql| log! ("escaped query: {}", sql)))}
   ///         let f = cluster.execute (op);
-  pub on_escape: Option<Box<Fn(&str) + Send + Sync + 'static>>,
+  pub on_escape: Option<Box<dyn Fn(&str) + Send + Sync + 'static>>,
 
   /// The time, in seconds since UNIX epoch, with fractions, when the operation SHOULD timeout.
   ///
@@ -242,7 +245,7 @@ impl<'a> PgRow<'a> {
         705 => Json::String (from_utf8 (self.col (column)) ?.into()),  // 705 unknown. SELECT 'foo'.
         1184 => {  // 1184 timestamptz
           let ts = unsafe {from_utf8_unchecked (self.col (column))};
-          let mut buf: [u8; 128] = unsafe {uninitialized()};
+          #[allow(invalid_value)] let mut buf: [u8; 128] = unsafe {MaybeUninit::uninit().assume_init()};
           let buf = gstring! (buf, {
             write! (buf, "{}", ts) .expect ("!write");
             // Turn "+03" into "+0300" to match the "%z" specifier.
@@ -564,7 +567,7 @@ enum Message {
 #[derive(Debug)]
 struct Connection {
   /// Keep connection string, allowing us to reconnect when connection fails.
-  dsn: String,
+  #[allow(dead_code)] dsn: String,
   handle: *mut pq::PGconn,
   in_flight: VecDeque<PgFuture>,
   /// Incoming futures pinned to this particular connection.
@@ -611,16 +614,17 @@ fn event_loop (rx: Receiver<Message>, read_end: c_int) {
   macro_rules! schedule {($pg_future: ident) => {{
     match $pg_future.0.op.scheduling {
       PgSchedulingMode::AnythingGoes => pending_futures.push_back ($pg_future),
-      PgSchedulingMode::PinToConnection (n) => connections[n as usize].pinned_pending_futures.push_back ($pg_future)}}}};
+      PgSchedulingMode::PinToConnection (n) => connections[n as usize].pinned_pending_futures.push_back ($pg_future)}}}}
 
   macro_rules! reschedule {($conn: ident, $pg_future: ident) => {{
     match $pg_future.0.op.scheduling {
       PgSchedulingMode::AnythingGoes => pending_futures.push_back ($pg_future),
-      PgSchedulingMode::PinToConnection (_) => $conn.pinned_pending_futures.push_back ($pg_future)}}}};
+      PgSchedulingMode::PinToConnection (_) => $conn.pinned_pending_futures.push_back ($pg_future)}}}}
 
   let mut fds = Vec::new();
   'event_loop: loop {
-    { let mut tmp: [u8; 256] = unsafe {std::mem::uninitialized()}; let _ = nix::unistd::read (read_end, &mut tmp); }
+    { #[allow(invalid_value)] let mut tmp: [u8; 256] = unsafe {MaybeUninit::uninit().assume_init()};
+      let _ = nix::unistd::read (read_end, &mut tmp); }
     loop {match rx.try_recv() {
       Err (TryRecvError::Disconnected) => break 'event_loop,  // Cluster was dropped.
       Err (TryRecvError::Empty) => break,
@@ -667,9 +671,10 @@ fn event_loop (rx: Receiver<Message>, read_end: c_int) {
         conn.in_flight_init = true;
       } else {
         let sock = unsafe {pq::PQsocket (conn.handle)};
+        let sock = unsafe {BorrowedFd::borrow_raw (sock)};
         match unsafe {pq::PQconnectPoll (conn.handle)} {
-          pq::PGRES_POLLING_READING => fds.push (PollFd::new (sock, poll::POLLIN, EventFlags::empty())),
-          pq::PGRES_POLLING_WRITING => fds.push (PollFd::new (sock, poll::POLLOUT, EventFlags::empty())),
+          pq::PGRES_POLLING_READING => fds.push (PollFd::new (sock, PollFlags::POLLIN)),
+          pq::PGRES_POLLING_WRITING => fds.push (PollFd::new (sock, PollFlags::POLLOUT)),
           _ => ()};}}
 
     // Try to find a connection that isn't currently busy.
@@ -787,7 +792,8 @@ fn event_loop (rx: Receiver<Message>, read_end: c_int) {
           panic! ("!PQconsumeInput: {}", err)}
 
         let rc = unsafe {pq::PQflush (conn.handle)};
-        if rc == 1 {fds.push (PollFd::new (sock, poll::POLLOUT, EventFlags::empty()))}
+        let sock = unsafe {BorrowedFd::borrow_raw (sock)};
+        if rc == 1 {fds.push (PollFd::new (sock, PollFlags::POLLOUT))}
 
         loop {
           if unsafe {pq::PQisBusy (conn.handle)} == 1 {break}
@@ -900,20 +906,21 @@ fn event_loop (rx: Receiver<Message>, read_end: c_int) {
             // If a statement fails then the rest of the pipeline fails. Reschedule the remaining futures.
             for future in conn.in_flight.drain (..) {reschedule! (conn, future)}}}
 
-        fds.push (PollFd::new (sock, poll::POLLIN, EventFlags::empty()))}}
+        fds.push (PollFd::new (sock, PollFlags::POLLIN))}}
 
-    fds.push (PollFd::new (read_end, poll::POLLIN, EventFlags::empty()));
-    let rc = poll::poll (&mut fds, 100) .expect ("!poll");
+    let read_end = unsafe {BorrowedFd::borrow_raw (read_end)};
+    fds.push (PollFd::new (read_end, PollFlags::POLLIN));
+    let rc = poll::poll (&mut fds, 100u16) .expect ("!poll");
     if rc == -1 {panic! ("!poll: {}", io::Error::last_os_error())}}
 
   for conn in connections {unsafe {pq::PQfinish (conn.handle)}}}
 
 // Wakes up the event loop by writing into the pipe.
 fn wake_up (write_end: c_int, payload: u8) -> Result<(), String> {
-  if let Err (err) = nix::unistd::write (write_end, &[payload]) {
-    match err {
-      nix::Error::Sys (errno) if errno == nix::Errno::EAGAIN => (),  // So the pipe can overflow when there's a lot of wake up calls.
-      _ => return ERR! ("!write on write_end: {}", err)}}
+  let write_endʹ = unsafe {BorrowedFd::borrow_raw (write_end)};
+  if let Err (err) = nix::unistd::write (write_endʹ, &[payload]) {
+    if matches! (err, nix::errno::Errno::EAGAIN) {}  // So the pipe can overflow when there's a lot of wake up calls.
+    else {return ERR! ("!write on write_end {}: {}", write_end, err)}}
   Ok(())}
 
 /// A cluster of several replicated PostgreSQL nodes.
@@ -931,12 +938,12 @@ impl Cluster {
   /// Start the thread.
   pub fn new() -> Result<Cluster, String> {
     let (tx, rx) = channel();
-    let (read_end, write_end) = try_s! (nix::unistd::pipe2 (O_NONBLOCK | O_CLOEXEC));
-    let thread = try_s! (std::thread::Builder::new().name ("pg_async".into()) .spawn (move || event_loop (rx, read_end)));
+    let (read_end, write_end) = try_s! (nix::unistd::pipe2 (OFlag::O_NONBLOCK | OFlag::O_CLOEXEC));
+    let thread = try_s! (std::thread::Builder::new().name ("pg_async".into()) .spawn (move || event_loop (rx, read_end.into_raw_fd())));
     Ok (Cluster {
       thread: Some (thread),
       tx: Mutex::new (tx),
-      write_end: write_end,
+      write_end: write_end.into_raw_fd(),
       command_num: Atomic::new (0u64)})}
 
   /// Setup a database connection to a [replicated] node.
