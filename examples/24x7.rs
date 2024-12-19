@@ -1,8 +1,6 @@
 // Run me with "cargo run --example 24x7".
 // Or "cargo run --example 24x7 -- --pin=0"
 
-#![feature(type_ascription, integer_atomics)]
-
 #[macro_use] extern crate fomat_macros;
 extern crate futures;
 extern crate futures_cpupool;
@@ -12,10 +10,10 @@ extern crate rand;
 
 use futures::future::Future;
 use futures_cpupool::CpuPool;
-use gstuff::{status_line, ISATTY};
+//use gstuff::{status_line, ISATTY};
 use pg_async::{Cluster, PgOperation, PgSchedulingMode};
 use pg_async::PgQueryPiece::{Plain as P};
-use rand::{StdRng, Rng};
+use rand::{thread_rng, RngCore};
 use std::collections::BTreeMap;
 use std::env::args;
 use std::fs;
@@ -23,11 +21,11 @@ use std::io::{self, BufRead};
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-macro_rules! status_line {($($args: tt)+) => {if *ISATTY {status_line (file!(), line!(), fomat! ($($args)+))}}}
+//macro_rules! status_line {($($args: tt)+) => {if *ISATTY {status_line (file!(), line!(), fomat! ($($args)+))}}}
 
 fn main() {
   let dsns: Vec<String> = (io::BufReader::new (fs::File::open ("../pg_async.dsns") .expect ("!pg_async.dsns"))
-    .lines().collect() :Result<Vec<String>, _>) .expect ("!pg_async.dsns");
+    .lines().collect::<Result<Vec<String>, _>>()) .expect ("!pg_async.dsns");
   let cluster = Cluster::new() .expect ("!Cluster");
   for dsn in dsns {cluster.connect (dsn.clone(), 1) .expect ("!connect")}
 
@@ -36,7 +34,7 @@ fn main() {
   let pin: Option<u8> = args().find (|a| a.starts_with ("--pin=")) .map (|a| (&a[6..]).parse().expect ("!parse"));
   if let Some (pin) = pin {println! ("Operations are pinned to connection {}.", pin);}
 
-  let mut rng = StdRng::new().expect ("!rng");
+  let mut rng = thread_rng();
   let mut slash = '/';
   let finished = Arc::new (AtomicU64::new (0));
   let errors = Arc::new (AtomicU64::new (0));
@@ -55,7 +53,7 @@ fn main() {
             query_pieces: vec! [P (fomat! ("SELECT " (rid) " AS rid"))],
             ..Default::default()})}};
 
-      let f: Box<Future<Item=(), Error=()> + Send> = {
+      let f: Box<dyn Future<Item=(), Error=()> + Send> = {
         let finished = finished.clone();
         let errors = errors.clone();
         let in_flight = in_flight.clone();
@@ -66,10 +64,10 @@ fn main() {
           futures::future::ok::<(), ()> (())}))};
       in_flight.lock().unwrap().insert (rid, pool.spawn (f));}
 
-    status_line! ((slash)
-      " Finished: " (finished.load (Ordering::Relaxed)) "."
-      " Errors: " (errors.load (Ordering::Relaxed)) "."
-      " In flight: " (in_flight.lock().unwrap().len()) '.');
+    // status_line! ((slash)
+    //   " Finished: " (finished.load (Ordering::Relaxed)) "."
+    //   " Errors: " (errors.load (Ordering::Relaxed)) "."
+    //   " In flight: " (in_flight.lock().unwrap().len()) '.');
     slash = match slash {'/' => '-', '-' => '\\', '\\' => '|', '|' | _ => '/'};
 
     std::thread::sleep (std::time::Duration::from_millis (100))}}

@@ -7,7 +7,7 @@ use super::*;
 
 lazy_static! {
   static ref DSNS: Vec<String> = (io::BufReader::new (fs::File::open ("../pg_async.dsns") .expect ("!pg_async.dsns"))
-    .lines().collect() :Result<Vec<String>, _>) .expect ("!pg_async.dsns");}
+    .lines().collect::<Result<Vec<String>, _>>()) .expect ("!pg_async.dsns");}
 
 #[test] fn select1() {
   let cluster = Cluster::new() .expect ("!Cluster");
@@ -22,7 +22,7 @@ lazy_static! {
 
   for (expect, pr) in results {
     let pr: PgResult = pr.wait().expect ("!pr") .remove (0);
-    assert_eq! (expect, pr.row (0) .col_str (0) .unwrap().parse().unwrap() :u8);}}
+    assert_eq! (expect, pr.row (0) .col_str (0) .unwrap().parse::<u8>().unwrap());}}
 
 fn check_send<T: Send>(_: &T) {}
 fn check_sync<T: Sync>(_: &T) {}
@@ -45,7 +45,7 @@ fn check_sync<T: Sync>(_: &T) {}
     let rc = op.wait();
     if i % 10 != 0 {
       let pr: PgResult = rc.expect ("!op") .remove (0);
-      assert_eq! (i, pr.row (0) .col_str (0) .unwrap().parse().unwrap() :u32);
+      assert_eq! (i, pr.row (0) .col_str (0) .unwrap().parse::<u32>().unwrap());
     } else {
       assert! (rc.is_err());}}}  // Expected error.
 
